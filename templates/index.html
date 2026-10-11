@@ -1,0 +1,245 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <meta name="theme-color" content="#0c1220">
+    <meta name="description" content="Explore global weather forecasts, air quality, and locations with WeatherWorld.">
+    <title>WeatherWorld | Global Weather Dashboard</title>
+
+    <link rel="preconnect" href="https://fonts.googleapis.com">
+    <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap" rel="stylesheet">
+
+    <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+</head>
+<body>
+<div class="app-shell">
+
+    <header class="topbar">
+        <a class="brand" href="/" aria-label="WeatherWorld home">
+            <span class="brand-icon">☀</span>
+            <span class="brand-copy">
+                <strong>Weather<span>World</span></strong>
+                <small>GLOBAL WEATHER DASHBOARD</small>
+            </span>
+        </a>
+
+        <div class="header-actions">
+            <span class="live-indicator"><i></i> Live weather</span>
+            <button id="unitToggle" class="secondary-button" type="button">°C / °F</button>
+            <button id="themeToggle" class="icon-button" type="button" aria-label="Toggle theme" title="Toggle theme">☾</button>
+        </div>
+    </header>
+
+    <main>
+        <section class="hero">
+            <div class="hero-copy">
+                <p class="eyebrow">YOUR WORLD, AT A GLANCE</p>
+                <h1>Weather, <span>everywhere.</span></h1>
+                <p class="hero-description">
+                    Explore current conditions, forecasts, and air quality around the globe.
+                </p>
+            </div>
+
+            <div class="search-panel">
+                <form id="searchForm" class="search-form" autocomplete="off">
+                    <span class="search-symbol" aria-hidden="true">⌕</span>
+                    <label class="sr-only" for="locationInput">City, town, village, or country</label>
+                    <input
+                        id="locationInput"
+                        type="search"
+                        maxlength="120"
+                        placeholder="Search city, town, village, or country..."
+                        autocomplete="off"
+                        required
+                    >
+                    <button id="searchButton" type="submit">Search <span>→</span></button>
+                    <div id="suggestions" class="suggestions hidden" role="listbox" aria-label="Location suggestions"></div>
+                </form>
+
+                <div class="search-tools">
+                    <button id="currentLocationButton" type="button" class="text-button">◎ Use my location</button>
+                    <button id="coordinateToggle" type="button" class="text-button">⌖ Search coordinates</button>
+                </div>
+
+                <form id="coordinateForm" class="coordinate-form hidden">
+                    <input id="latitudeInput" type="number" min="-90" max="90" step="any" placeholder="Latitude" aria-label="Latitude" required>
+                    <input id="longitudeInput" type="number" min="-180" max="180" step="any" placeholder="Longitude" aria-label="Longitude" required>
+                    <button type="submit">Find weather</button>
+                </form>
+
+                <p class="search-tip">Tip: include a country for better results, e.g. <strong>Kambalakunta, India</strong>.</p>
+            </div>
+        </section>
+
+        <div id="statusMessage" class="status-message hidden" role="status" aria-live="polite"></div>
+
+        <section class="dashboard-grid">
+            <div class="main-column">
+
+                <section class="panel current-panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">CURRENT CONDITIONS</p>
+                            <h2>Weather right now</h2>
+                        </div>
+                        <button id="favoriteButton" class="icon-button favorite-button" type="button" aria-label="Save this location" title="Save this location">☆</button>
+                    </div>
+
+                    <div id="currentWeather">
+                        <div class="empty-state">
+                            <span class="empty-icon">🌍</span>
+                            <h3>Discover the weather</h3>
+                            <p>Search for a city, town, or village to get started.</p>
+                        </div>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">COMING UP</p>
+                            <h2>Hourly forecast</h2>
+                        </div>
+                        <span class="subtle-label">Next 24 hours</span>
+                    </div>
+                    <div id="hourlyForecast" class="hourly-list">
+                        <p class="muted">Search for a location to load the forecast.</p>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">PLAN AHEAD</p>
+                            <h2>7-day forecast</h2>
+                        </div>
+                    </div>
+                    <div id="dailyForecast" class="daily-list">
+                        <p class="muted">Your weekly forecast will appear here.</p>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">BREATHE INFORMED</p>
+                            <h2>Air quality</h2>
+                        </div>
+                        <span id="airQualityStatus" class="status-pill">Awaiting data</span>
+                    </div>
+
+                    <div id="airSummary" class="air-summary">
+                        <div class="air-score-placeholder">—</div>
+                        <div>
+                            <h3>Air quality overview</h3>
+                            <p class="muted">Search for a location to load AQI and pollutant readings.</p>
+                        </div>
+                    </div>
+
+                    <div class="aqi-scale" aria-label="US AQI categories">
+                        <span class="aqi-good">Good</span>
+                        <span class="aqi-moderate">Moderate</span>
+                        <span class="aqi-sensitive">Sensitive</span>
+                        <span class="aqi-unhealthy">Unhealthy</span>
+                        <span class="aqi-severe">Very unhealthy</span>
+                    </div>
+
+                    <div class="pollutant-grid">
+                        <div class="pollutant-card"><span>PM2.5</span><strong id="pm25Value">—</strong><small>µg/m³</small></div>
+                        <div class="pollutant-card"><span>PM10</span><strong id="pm10Value">—</strong><small>µg/m³</small></div>
+                        <div class="pollutant-card"><span>Carbon monoxide</span><strong id="coValue">—</strong><small>µg/m³</small></div>
+                        <div class="pollutant-card"><span>Nitrogen dioxide</span><strong id="no2Value">—</strong><small>µg/m³</small></div>
+                        <div class="pollutant-card"><span>Sulphur dioxide</span><strong id="so2Value">—</strong><small>µg/m³</small></div>
+                        <div class="pollutant-card"><span>Ozone</span><strong id="o3Value">—</strong><small>µg/m³</small></div>
+                    </div>
+
+                    <p id="airDetail" class="air-detail muted">
+                        Measurements depend on provider availability. Follow official local health guidance.
+                    </p>
+                </section>
+            </div>
+
+            <aside class="side-column">
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">EXPLORE</p>
+                            <h2>Weather map</h2>
+                        </div>
+                    </div>
+                    <div id="weatherMap" aria-label="Interactive location map"></div>
+                    <p class="map-caption">Select a point on the map to fill the coordinate search fields.</p>
+                    <div class="location-coordinates">
+                        <span>Selected coordinates</span>
+                        <strong id="coordinatesDisplay">—</strong>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">QUICK ACCESS</p>
+                            <h2>Favorite locations</h2>
+                        </div>
+                    </div>
+                    <div id="favoritesList" class="saved-list">
+                        <p class="muted">Your saved locations will appear here.</p>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">RECENT SEARCHES</p>
+                            <h2>Search history</h2>
+                        </div>
+                        <button id="refreshHistoryButton" type="button" class="text-button">Refresh</button>
+                    </div>
+                    <div id="historyList" class="saved-list">
+                        <p class="muted">Your recent searches will appear here.</p>
+                    </div>
+                </section>
+
+                <section class="panel">
+                    <div class="section-heading">
+                        <div>
+                            <p class="eyebrow">YOUR DATA</p>
+                            <h2>Export & status</h2>
+                        </div>
+                    </div>
+                    <button id="exportButton" class="wide-button" type="button">↓ Export history as CSV</button>
+                    <div class="api-status-row">
+                        <span id="apiStatusDot" class="api-dot"></span>
+                        <span>Weather service</span>
+                        <strong id="apiStatusText">Checking…</strong>
+                    </div>
+                    <p class="small-note">WeatherWorld uses external weather and geocoding services.</p>
+                </section>
+            </aside>
+        </section>
+    </main>
+
+    <footer class="footer">
+        <span>WeatherWorld · Global Weather Dashboard</span>
+        <span>Weather and air quality data via Open-Meteo</span>
+    </footer>
+</div>
+
+<div id="loadingOverlay" class="loading-overlay hidden" aria-live="polite" aria-busy="true">
+    <div class="loading-card">
+        <div class="spinner"></div>
+        <strong>Fetching weather</strong>
+        <span>Updating conditions and forecasts…</span>
+    </div>
+</div>
+
+<div id="toast" class="toast hidden" role="status" aria-live="polite"></div>
+
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="{{ url_for('static', filename='script.js') }}"></script>
+</body>
+</html>
