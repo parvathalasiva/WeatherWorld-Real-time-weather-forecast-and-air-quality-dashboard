@@ -2,787 +2,260 @@
 import csv
 import io
 import logging
+import math
 import os
 import sqlite3
-import threading
-import time
-import unicodedata
 from datetime import datetime, timezone
-from difflib import SequenceMatcher
+from pathlib import Path
 
 import requests
-from flask import Flask, jsonify, render_template, request, Response
+from flask import Flask, Response, jsonify, render_template, request
 
 # ============================================================
-# WEATHERWORLD - GLOBAL WEATHER DASHBOARD
-# Flask + SQLite + Open-Meteo + OpenStreetMap
+# WEATHERWORLD CONFIGURATION
 # ============================================================
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
+app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger("weatherworld")
+app.logger.setLevel(logging.INFO)
 
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-DATABASE = os.path.join(BASE_DIR, "weather_history.db")
+DATABASE_PATH = os.environ.get("DATABASE_PATH", "weather_history.db")
+REQUEST_TIMEOUT = 15
 
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
-WEATHER_URL = "https://api.open-meteo.com/v1/forecast"
+FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
-NOMINATIM_URL = "https://nominatim.openstreetmap.org/search"
 
-HTTP_TIMEOUT = 20
-WEATHER_CACHE_SECONDS = 300
-GEOCODING_CACHE_SECONDS = 3600
-AIR_CACHE_SECONDS = 600
-
-HTTP = requests.Session()
-HTTP.headers.update({
-    "User-Agent": "WeatherWorldDashboard/2.0",
-    "Accept": "application/json",
-})
-
-_cache = {}
-_cache_lock = threading.Lock()
-_db_lock = threading.RLock()
-_nominatim_lock = threading.Lock()
-_last_nominatim_request = 0.0
-
-
-# ============================================================
-# Country aliases
-# ============================================================
-
-COUNTRIES = {
-    "india": ("IN", "India"),
-    "bharat": ("IN", "India"),
-    "united states": ("US", "United States"),
-    "united states of america": ("US", "United States"),
-    "usa": ("US", "United States"),
-    "us": ("US", "United States"),
-    "america": ("US", "United States"),
-    "united kingdom": ("GB", "United Kingdom"),
-    "uk": ("GB", "United Kingdom"),
-    "great britain": ("GB", "United Kingdom"),
-    "britain": ("GB", "United Kingdom"),
-    "england": ("GB", "United Kingdom"),
-    "australia": ("AU", "Australia"),
-    "canada": ("CA", "Canada"),
-    "new zealand": ("NZ", "New Zealand"),
-    "singapore": ("SG", "Singapore"),
-    "japan": ("JP", "Japan"),
-    "china": ("CN", "China"),
-    "pakistan": ("PK", "Pakistan"),
-    "bangladesh": ("BD", "Bangladesh"),
-    "sri lanka": ("LK", "Sri Lanka"),
-    "nepal": ("NP", "Nepal"),
-    "bhutan": ("BT", "Bhutan"),
-    "maldives": ("MV", "Maldives"),
-    "indonesia": ("ID", "Indonesia"),
-    "malaysia": ("MY", "Malaysia"),
-    "thailand": ("TH", "Thailand"),
-    "vietnam": ("VN", "Vietnam"),
-    "philippines": ("PH", "Philippines"),
-    "south korea": ("KR", "South Korea"),
-    "korea": ("KR", "South Korea"),
-    "north korea": ("KP", "North Korea"),
-    "germany": ("DE", "Germany"),
-    "france": ("FR", "France"),
-    "italy": ("IT", "Italy"),
-    "spain": ("ES", "Spain"),
-    "portugal": ("PT", "Portugal"),
-    "netherlands": ("NL", "Netherlands"),
-    "belgium": ("BE", "Belgium"),
-    "switzerland": ("CH", "Switzerland"),
-    "austria": ("AT", "Austria"),
-    "sweden": ("SE", "Sweden"),
-    "norway": ("NO", "Norway"),
-    "denmark": ("DK", "Denmark"),
-    "finland": ("FI", "Finland"),
-    "ireland": ("IE", "Ireland"),
-    "poland": ("PL", "Poland"),
-    "ukraine": ("UA", "Ukraine"),
-    "russia": ("RU", "Russia"),
-    "turkey": ("TR", "Türkiye"),
-    "turkiye": ("TR", "Türkiye"),
-    "united arab emirates": ("AE", "United Arab Emirates"),
-    "uae": ("AE", "United Arab Emirates"),
-    "saudi arabia": ("SA", "Saudi Arabia"),
-    "qatar": ("QA", "Qatar"),
-    "oman": ("OM", "Oman"),
-    "kuwait": ("KW", "Kuwait"),
-    "bahrain": ("BH", "Bahrain"),
-    "israel": ("IL", "Israel"),
-    "egypt": ("EG", "Egypt"),
-    "south africa": ("ZA", "South Africa"),
-    "nigeria": ("NG", "Nigeria"),
-    "kenya": ("KE", "Kenya"),
-    "ghana": ("GH", "Ghana"),
-    "ethiopia": ("ET", "Ethiopia"),
-    "morocco": ("MA", "Morocco"),
-    "algeria": ("DZ", "Algeria"),
-    "brazil": ("BR", "Brazil"),
-    "argentina": ("AR", "Argentina"),
-    "chile": ("CL", "Chile"),
-    "colombia": ("CO", "Colombia"),
-    "mexico": ("MX", "Mexico"),
-    "peru": ("PE", "Peru"),
-    "cuba": ("CU", "Cuba"),
-    "jamaica": ("JM", "Jamaica"),
+DEFAULT_LOCATION = {
+    "name": "Kadapa",
+    "country": "India",
+    "latitude": 14.46795,
+    "longitude": 78.82346,
+    "timezone": "Asia/Kolkata",
 }
 
-PLACE_ALIASES = {
-    "bangalore": ["Bengaluru"],
-    "bengaluru": ["Bangalore"],
-    "bombay": ["Mumbai"],
-    "mumbai": ["Bombay"],
-    "madras": ["Chennai"],
-    "chennai": ["Madras"],
-    "calcutta": ["Kolkata"],
-    "kolkata": ["Calcutta"],
-    "baroda": ["Vadodara"],
-    "vadodara": ["Baroda"],
-    "cochin": ["Kochi"],
-    "kochi": ["Cochin"],
-    "trivandrum": ["Thiruvananthapuram"],
-    "mysore": ["Mysuru"],
-    "poona": ["Pune"],
-    "allahabad": ["Prayagraj"],
-    "gurgaon": ["Gurugram"],
-    "vizag": ["Visakhapatnam"],
-    "cuddapah": ["Kadapa"],
-    "kadapa": ["Cuddapah"],
+WEATHER_CODES = {
+    0: ("Clear sky", "☀️"),
+    1: ("Mainly clear", "🌤️"),
+    2: ("Partly cloudy", "⛅"),
+    3: ("Overcast", "☁️"),
+    45: ("Fog", "🌫️"),
+    48: ("Depositing rime fog", "🌫️"),
+    51: ("Light drizzle", "🌦️"),
+    53: ("Moderate drizzle", "🌦️"),
+    55: ("Dense drizzle", "🌧️"),
+    56: ("Light freezing drizzle", "🌧️"),
+    57: ("Dense freezing drizzle", "🌧️"),
+    61: ("Slight rain", "🌦️"),
+    63: ("Moderate rain", "🌧️"),
+    65: ("Heavy rain", "🌧️"),
+    66: ("Light freezing rain", "🌧️"),
+    67: ("Heavy freezing rain", "🌧️"),
+    71: ("Slight snowfall", "🌨️"),
+    73: ("Moderate snowfall", "🌨️"),
+    75: ("Heavy snowfall", "❄️"),
+    77: ("Snow grains", "🌨️"),
+    80: ("Slight rain showers", "🌦️"),
+    81: ("Moderate rain showers", "🌧️"),
+    82: ("Violent rain showers", "⛈️"),
+    85: ("Slight snow showers", "🌨️"),
+    86: ("Heavy snow showers", "❄️"),
+    95: ("Thunderstorm", "⛈️"),
+    96: ("Thunderstorm with hail", "⛈️"),
+    99: ("Thunderstorm with heavy hail", "⛈️"),
 }
 
 
 # ============================================================
-# General helpers
+# DATABASE
 # ============================================================
+
+def connect_db():
+    """Create a SQLite connection with sensible defaults."""
+    if DATABASE_PATH != ":memory:":
+        Path(DATABASE_PATH).expanduser().resolve().parent.mkdir(
+            parents=True, exist_ok=True
+        )
+
+    db = sqlite3.connect(DATABASE_PATH, timeout=15)
+    db.row_factory = sqlite3.Row
+    db.execute("PRAGMA busy_timeout = 15000")
+    db.execute("PRAGMA foreign_keys = ON")
+    return db
+
+
+def initialize_database():
+    """Create database tables and indexes."""
+    with connect_db() as db:
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS favorites (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                country TEXT NOT NULL DEFAULT '',
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'auto',
+                created_at TEXT NOT NULL,
+                UNIQUE(latitude, longitude)
+            )
+        """)
+
+        db.execute("""
+            CREATE TABLE IF NOT EXISTS search_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                country TEXT NOT NULL DEFAULT '',
+                latitude REAL NOT NULL,
+                longitude REAL NOT NULL,
+                timezone TEXT NOT NULL DEFAULT 'auto',
+                searched_at TEXT NOT NULL
+            )
+        """)
+
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_history_searched_at
+            ON search_history(searched_at)
+        """)
+
+        db.commit()
+
 
 def utc_now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
-def normalize_text(value):
-    value = str(value or "").strip().lower()
-    value = unicodedata.normalize("NFKD", value)
-    value = "".join(
-        char for char in value
-        if not unicodedata.combining(char)
-    )
-    return " ".join(value.replace(",", " ").split())
+# ============================================================
+# VALIDATION AND HELPERS
+# ============================================================
+
+def clean_text(value, default="", max_length=150):
+    if value is None:
+        return default
+    result = str(value).strip()
+    return result[:max_length] if result else default
 
 
-def country_from_text(value):
-    return COUNTRIES.get(normalize_text(value))
+def parse_coordinate(value, field_name):
+    try:
+        number = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(f"Please provide a valid {field_name}.")
+
+    if not math.isfinite(number):
+        raise ValueError(f"{field_name.capitalize()} must be finite.")
+
+    if field_name == "latitude" and not -90 <= number <= 90:
+        raise ValueError("Latitude must be between -90 and 90.")
+
+    if field_name == "longitude" and not -180 <= number <= 180:
+        raise ValueError("Longitude must be between -180 and 180.")
+
+    return number
 
 
-def cached_get_json(url, params=None, ttl=300):
-    params = params or {}
-    key = (url, tuple(sorted(params.items())))
+def error_response(message, status_code=400):
+    return jsonify({"error": message}), status_code
 
-    with _cache_lock:
-        cached = _cache.get(key)
-        if cached and cached[0] > time.time():
-            return cached[1]
 
-    response = HTTP.get(
+def api_get(url, params):
+    """Request JSON from an Open-Meteo endpoint."""
+    response = requests.get(
         url,
         params=params,
-        timeout=HTTP_TIMEOUT,
+        timeout=REQUEST_TIMEOUT,
+        headers={"User-Agent": "WeatherWorld/2.0"},
     )
     response.raise_for_status()
-    result = response.json()
 
-    with _cache_lock:
-        _cache[key] = (time.time() + ttl, result)
+    data = response.json()
+    if not isinstance(data, dict):
+        raise ValueError("Unexpected response from the weather provider.")
 
-    return result
+    if data.get("error"):
+        raise ValueError(
+            clean_text(data.get("reason"), "Weather provider returned an error.")
+        )
 
-
-def split_location_query(query, country=""):
-    query = str(query or "").strip()
-    country = str(country or "").strip()
-
-    country_code = None
-    country_name = None
-
-    if country:
-        known_country = country_from_text(country)
-        if known_country:
-            country_code, country_name = known_country
-        else:
-            country_name = country
-
-    parts = [part.strip() for part in query.split(",") if part.strip()]
-    search_name = query
-
-    if len(parts) >= 2:
-        possible_country = country_from_text(parts[-1])
-        if possible_country:
-            country_code, country_name = possible_country
-            search_name = ", ".join(parts[:-1])
-
-    query_country = country_from_text(query)
-    if query_country:
-        country_code, country_name = query_country
-        search_name = country_name
-
-    return search_name.strip(), country_code, country_name
+    return data
 
 
-def make_queries(query, country_name=None):
-    query = str(query or "").strip()
-    if not query:
-        return []
-
-    search_name, _, parsed_country = split_location_query(query)
-    country_name = country_name or parsed_country
-
-    candidates = [query, search_name]
-
-    alias_key = normalize_text(search_name)
-    for alias in PLACE_ALIASES.get(alias_key, []):
-        candidates.append(alias)
-        if country_name:
-            candidates.append(f"{alias}, {country_name}")
-
-    if country_name and search_name:
-        candidates.append(f"{search_name}, {country_name}")
-
-    output = []
-    seen = set()
-
-    for item in candidates:
-        item = item.strip()
-        key = normalize_text(item)
-        if key and key not in seen:
-            output.append(item)
-            seen.add(key)
-
-    return output[:8]
-
-
-def normalize_open_meteo_place(place):
+def location_from_args():
     return {
-        "id": place.get("id"),
-        "name": place.get("name", "Unknown location"),
-        "latitude": float(place["latitude"]),
-        "longitude": float(place["longitude"]),
-        "country": place.get("country", ""),
-        "country_code": str(place.get("country_code", "")).upper(),
-        "admin1": place.get("admin1", ""),
-        "admin2": place.get("admin2", ""),
-        "timezone": place.get("timezone", ""),
-        "population": place.get("population"),
-        "source": "Open-Meteo",
+        "name": clean_text(request.args.get("name"), "Selected location"),
+        "country": clean_text(request.args.get("country"), ""),
+        "latitude": parse_coordinate(
+            request.args.get("latitude"), "latitude"
+        ),
+        "longitude": parse_coordinate(
+            request.args.get("longitude"), "longitude"
+        ),
+        "timezone": clean_text(request.args.get("timezone"), "auto", 100),
     }
 
 
-def normalize_osm_place(place):
-    address = place.get("address") or {}
-
-    name = (
-        place.get("name")
-        or address.get("village")
-        or address.get("town")
-        or address.get("city")
-        or address.get("hamlet")
-        or address.get("municipality")
-        or place.get("display_name", "").split(",")[0]
-        or "Unknown location"
-    )
-
+def location_from_json(body):
     return {
-        "id": place.get("place_id"),
-        "name": name,
-        "latitude": float(place["lat"]),
-        "longitude": float(place["lon"]),
-        "country": address.get("country", ""),
-        "country_code": str(address.get("country_code", "")).upper(),
-        "admin1": (
-            address.get("state")
-            or address.get("region")
-            or address.get("state_district")
-            or ""
-        ),
-        "admin2": (
-            address.get("county")
-            or address.get("district")
-            or address.get("city_district")
-            or ""
-        ),
-        "timezone": "",
-        "source": "OpenStreetMap",
-        "display_name": place.get("display_name", ""),
+        "name": clean_text(body.get("name"), "Saved location"),
+        "country": clean_text(body.get("country"), ""),
+        "latitude": parse_coordinate(body.get("latitude"), "latitude"),
+        "longitude": parse_coordinate(body.get("longitude"), "longitude"),
+        "timezone": clean_text(body.get("timezone"), "auto", 100),
     }
-
-
-def deduplicate_locations(locations):
-    output = []
-    seen = set()
-
-    for item in locations:
-        try:
-            lat = round(float(item["latitude"]), 4)
-            lon = round(float(item["longitude"]), 4)
-        except (ValueError, TypeError, KeyError):
-            continue
-
-        key = (lat, lon)
-        if key in seen:
-            continue
-
-        seen.add(key)
-        output.append(item)
-
-    return output
-
-
-def location_score(place, query, country_code=None):
-    name = normalize_text(place.get("name"))
-    query = normalize_text(query)
-    score = 0
-
-    if name == query:
-        score += 100
-    elif name.startswith(query):
-        score += 70
-    elif query and query in name:
-        score += 45
-    else:
-        score += int(SequenceMatcher(None, name, query).ratio() * 25)
-
-    if country_code and place.get("country_code", "").upper() == country_code.upper():
-        score += 100
-
-    population = place.get("population")
-    try:
-        score += min(int(population or 0) // 100000, 15)
-    except (ValueError, TypeError):
-        pass
-
-    return score
-
-
-# ============================================================
-# SQLite: robust initialization and schema migration
-# ============================================================
-
-def get_db():
-    connection = sqlite3.connect(DATABASE, timeout=20)
-    connection.row_factory = sqlite3.Row
-    connection.execute("PRAGMA busy_timeout = 20000")
-    return connection
-
-
-def table_exists(connection, table_name):
-    result = connection.execute("""
-        SELECT name FROM sqlite_master
-        WHERE type = 'table' AND name = ?
-    """, (table_name,)).fetchone()
-    return result is not None
-
-
-def get_columns(connection, table_name):
-    if not table_exists(connection, table_name):
-        return set()
-
-    rows = connection.execute(
-        f'PRAGMA table_info("{table_name}")'
-    ).fetchall()
-
-    return {row["name"] for row in rows}
-
-
-def add_missing_columns(connection, table_name, definitions):
-    """
-    Add missing columns without deleting the user's existing database.
-
-    Definitions must use fixed internal SQL column definitions, not user input.
-    """
-    existing = get_columns(connection, table_name)
-
-    for column, definition in definitions.items():
-        if column not in existing:
-            connection.execute(
-                f'ALTER TABLE "{table_name}" ADD COLUMN "{column}" {definition}'
-            )
-
-
-def init_db():
-    """
-    Initialize or upgrade the database.
-
-    Crucially, this does not assume an existing database has the latest
-    schema. Indexes are created only after the relevant columns exist.
-    """
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            connection.execute("PRAGMA journal_mode = WAL")
-
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS weather_history (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT DEFAULT '',
-                    country TEXT DEFAULT '',
-                    country_code TEXT DEFAULT '',
-                    admin1 TEXT DEFAULT '',
-                    latitude REAL,
-                    longitude REAL,
-                    searched_at TEXT DEFAULT ''
-                )
-            """)
-
-            connection.execute("""
-                CREATE TABLE IF NOT EXISTS favorites (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
-                    name TEXT DEFAULT '',
-                    country TEXT DEFAULT '',
-                    country_code TEXT DEFAULT '',
-                    admin1 TEXT DEFAULT '',
-                    latitude REAL,
-                    longitude REAL,
-                    created_at TEXT DEFAULT ''
-                )
-            """)
-
-            # Migrate older versions of weather_history.db in place.
-            add_missing_columns(connection, "weather_history", {
-                "name": "TEXT DEFAULT ''",
-                "country": "TEXT DEFAULT ''",
-                "country_code": "TEXT DEFAULT ''",
-                "admin1": "TEXT DEFAULT ''",
-                "latitude": "REAL",
-                "longitude": "REAL",
-                "searched_at": "TEXT DEFAULT ''",
-            })
-
-            add_missing_columns(connection, "favorites", {
-                "name": "TEXT DEFAULT ''",
-                "country": "TEXT DEFAULT ''",
-                "country_code": "TEXT DEFAULT ''",
-                "admin1": "TEXT DEFAULT ''",
-                "latitude": "REAL",
-                "longitude": "REAL",
-                "created_at": "TEXT DEFAULT ''",
-            })
-
-            # Preserve data from common column names in older schemas.
-            history_columns = get_columns(connection, "weather_history")
-
-            if "city" in history_columns:
-                connection.execute("""
-                    UPDATE weather_history
-                    SET name = city
-                    WHERE (name IS NULL OR name = '')
-                      AND city IS NOT NULL
-                """)
-
-            if "location" in history_columns:
-                connection.execute("""
-                    UPDATE weather_history
-                    SET name = location
-                    WHERE (name IS NULL OR name = '')
-                      AND location IS NOT NULL
-                """)
-
-            if "timestamp" in history_columns:
-                connection.execute("""
-                    UPDATE weather_history
-                    SET searched_at = timestamp
-                    WHERE (searched_at IS NULL OR searched_at = '')
-                      AND timestamp IS NOT NULL
-                """)
-
-            if "search_time" in history_columns:
-                connection.execute("""
-                    UPDATE weather_history
-                    SET searched_at = search_time
-                    WHERE (searched_at IS NULL OR searched_at = '')
-                      AND search_time IS NOT NULL
-                """)
-
-            favorites_columns = get_columns(connection, "favorites")
-
-            if "city" in favorites_columns:
-                connection.execute("""
-                    UPDATE favorites
-                    SET name = city
-                    WHERE (name IS NULL OR name = '')
-                      AND city IS NOT NULL
-                """)
-
-            # Backfill blanks so the frontend gets consistent fields.
-            connection.execute("""
-                UPDATE weather_history
-                SET name = 'Unknown location'
-                WHERE name IS NULL OR name = ''
-            """)
-
-            connection.execute("""
-                UPDATE weather_history
-                SET searched_at = ?
-                WHERE searched_at IS NULL OR searched_at = ''
-            """, (utc_now(),))
-
-            connection.execute("""
-                UPDATE favorites
-                SET name = 'Saved location'
-                WHERE name IS NULL OR name = ''
-            """)
-
-            connection.execute("""
-                UPDATE favorites
-                SET created_at = ?
-                WHERE created_at IS NULL OR created_at = ''
-            """, (utc_now(),))
-
-            # Create indexes only after migration guarantees the columns exist.
-            history_columns = get_columns(connection, "weather_history")
-            if "searched_at" in history_columns:
-                connection.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_weather_history_time
-                    ON weather_history(searched_at DESC)
-                """)
-
-            favorite_columns = get_columns(connection, "favorites")
-            if "latitude" in favorite_columns and "longitude" in favorite_columns:
-                connection.execute("""
-                    CREATE INDEX IF NOT EXISTS idx_favorites_coordinates
-                    ON favorites(latitude, longitude)
-                """)
-
-            connection.commit()
-            logger.info("SQLite database initialized successfully: %s", DATABASE)
-
-        except sqlite3.Error:
-            connection.rollback()
-            logger.exception("Database initialization failed")
-            raise
-        finally:
-            connection.close()
 
 
 def record_search(location):
-    with _db_lock:
-        connection = get_db()
+    with connect_db() as db:
+        db.execute("""
+            INSERT INTO search_history
+                (name, country, latitude, longitude, timezone, searched_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+        """, (
+            location["name"],
+            location["country"],
+            location["latitude"],
+            location["longitude"],
+            location["timezone"],
+            utc_now(),
+        ))
 
-        try:
-            connection.execute("""
-                INSERT INTO weather_history
-                    (name, country, country_code, admin1,
-                     latitude, longitude, searched_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (
-                location.get("name", "Unknown location"),
-                location.get("country", ""),
-                location.get("country_code", ""),
-                location.get("admin1", ""),
-                location.get("latitude"),
-                location.get("longitude"),
-                utc_now(),
-            ))
-
-            connection.execute("""
-                DELETE FROM weather_history
-                WHERE id NOT IN (
-                    SELECT id FROM weather_history
-                    ORDER BY searched_at DESC, id DESC
-                    LIMIT 100
-                )
-            """)
-
-            connection.commit()
-        finally:
-            connection.close()
-
-
-def row_location(row):
-    return {
-        "id": row["id"],
-        "name": row["name"] or "Unknown location",
-        "country": row["country"] or "",
-        "country_code": row["country_code"] or "",
-        "admin1": row["admin1"] or "",
-        "latitude": row["latitude"],
-        "longitude": row["longitude"],
-    }
-
-
-# ============================================================
-# Location search providers
-# ============================================================
-
-def search_open_meteo(query, country_code=None):
-    params = {
-        "name": query,
-        "count": 10,
-        "language": "en",
-        "format": "json",
-    }
-
-    if country_code:
-        params["countryCode"] = country_code.upper()
-
-    try:
-        data = cached_get_json(
-            GEOCODING_URL,
-            params,
-            GEOCODING_CACHE_SECONDS,
-        )
-
-        places = [
-            normalize_open_meteo_place(item)
-            for item in (data.get("results") or [])
-        ]
-
-        if country_code:
-            places = [
-                item for item in places
-                if item["country_code"] == country_code.upper()
-            ]
-
-        return places
-
-    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-        logger.warning("Open-Meteo search failed for %s: %s", query, exc)
-        return []
-
-
-def search_nominatim(query, country_code=None):
-    global _last_nominatim_request
-
-    params = {
-        "q": query,
-        "format": "jsonv2",
-        "addressdetails": 1,
-        "limit": 10,
-        "accept-language": "en",
-    }
-
-    if country_code:
-        params["countrycodes"] = country_code.lower()
-
-    try:
-        # Respect the public Nominatim service's request rate limit.
-        with _nominatim_lock:
-            elapsed = time.time() - _last_nominatim_request
-            if elapsed < 1.1:
-                time.sleep(1.1 - elapsed)
-
-            response = HTTP.get(
-                NOMINATIM_URL,
-                params=params,
-                timeout=HTTP_TIMEOUT,
+        # Retain only the most recent 100 searches.
+        db.execute("""
+            DELETE FROM search_history
+            WHERE id NOT IN (
+                SELECT id FROM search_history
+                ORDER BY id DESC LIMIT 100
             )
-            _last_nominatim_request = time.time()
-
-        response.raise_for_status()
-
-        places = [
-            normalize_osm_place(item)
-            for item in response.json()
-            if item.get("lat") is not None and item.get("lon") is not None
-        ]
-
-        if country_code:
-            places = [
-                item for item in places
-                if item["country_code"] == country_code.upper()
-            ]
-
-        return places
-
-    except (requests.RequestException, ValueError, KeyError, TypeError) as exc:
-        logger.warning("OpenStreetMap search failed for %s: %s", query, exc)
-        return []
+        """)
+        db.commit()
 
 
-def search_locations(query, country=""):
-    query = str(query or "").strip()
-    country = str(country or "").strip()
-
-    if not query:
-        return []
-
-    if len(query) > 120:
-        query = query[:120].strip()
-
-    search_name, country_code, country_name = split_location_query(query, country)
-
-    if not country_code and country:
-        found_country = country_from_text(country)
-        if found_country:
-            country_code, country_name = found_country
-
-    queries = make_queries(search_name or query, country_name)
-    all_results = []
-
-    # Open-Meteo is the primary geocoding service.
-    for candidate in queries[:6]:
-        results = search_open_meteo(candidate, country_code)
-        all_results.extend(results)
-
-        if any(
-            normalize_text(item["name"]) == normalize_text(search_name)
-            for item in results
-        ):
-            break
-
-    all_results = deduplicate_locations(all_results)
-
-    exact_match = any(
-        normalize_text(item["name"]) == normalize_text(search_name)
-        for item in all_results
-    )
-
-    # Use OSM as a fallback for small towns, villages, and localities.
-    if not all_results or (len(all_results) < 2 and not exact_match):
-        for candidate in queries[:4]:
-            results = search_nominatim(candidate, country_code)
-            all_results.extend(results)
-
-            if any(
-                normalize_text(item["name"]) == normalize_text(search_name)
-                for item in results
-            ):
-                break
-
-    all_results = deduplicate_locations(all_results)
-
-    # Enforce a requested country.
-    if country_code:
-        all_results = [
-            item for item in all_results
-            if item.get("country_code", "").upper() == country_code.upper()
-        ]
-
-    all_results.sort(
-        key=lambda item: location_score(
-            item, search_name or query, country_code
-        ),
-        reverse=True,
-    )
-
-    return all_results[:10]
+def weather_description(code):
+    try:
+        return WEATHER_CODES.get(
+            int(code), ("Unknown conditions", "🌡️")
+        )
+    except (TypeError, ValueError):
+        return ("Unknown conditions", "🌡️")
 
 
 # ============================================================
-# Weather and air quality
+# OPEN-METEO FORECAST
 # ============================================================
 
-def fetch_weather(latitude, longitude):
+def get_forecast(latitude, longitude, timezone_name="auto"):
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "timezone": "auto",
+        "timezone": timezone_name,
         "forecast_days": 7,
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
+        "precipitation_unit": "mm",
+
+        # Current conditions. UV index is explicitly requested.
         "current": ",".join([
             "temperature_2m",
             "relative_humidity_2m",
@@ -799,7 +272,10 @@ def fetch_weather(latitude, longitude):
             "wind_speed_10m",
             "wind_direction_10m",
             "wind_gusts_10m",
+            "uv_index",
         ]),
+
+        # Hourly forecast, including UV index.
         "hourly": ",".join([
             "temperature_2m",
             "relative_humidity_2m",
@@ -807,8 +283,10 @@ def fetch_weather(latitude, longitude):
             "precipitation",
             "weather_code",
             "wind_speed_10m",
-            "wind_direction_10m",
+            "uv_index",
         ]),
+
+        # Seven-day forecast and daily maximum UV.
         "daily": ",".join([
             "weather_code",
             "temperature_2m_max",
@@ -816,28 +294,23 @@ def fetch_weather(latitude, longitude):
             "sunrise",
             "sunset",
             "uv_index_max",
-            "precipitation_probability_max",
             "precipitation_sum",
+            "precipitation_probability_max",
             "wind_speed_10m_max",
         ]),
     }
 
-    return cached_get_json(
-        WEATHER_URL,
-        params,
-        WEATHER_CACHE_SECONDS,
-    )
+    return api_get(FORECAST_URL, params)
 
 
-def fetch_air_quality(latitude, longitude):
+def get_air_quality(latitude, longitude, timezone_name="auto"):
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "timezone": "auto",
-        "forecast_days": 1,
+        "timezone": timezone_name,
         "current": ",".join([
-            "us_aqi",
             "european_aqi",
+            "us_aqi",
             "pm10",
             "pm2_5",
             "carbon_monoxide",
@@ -845,494 +318,431 @@ def fetch_air_quality(latitude, longitude):
             "sulphur_dioxide",
             "ozone",
         ]),
-        "hourly": ",".join([
-            "us_aqi",
-            "european_aqi",
-            "pm10",
-            "pm2_5",
-        ]),
     }
 
-    return cached_get_json(
-        AIR_QUALITY_URL,
-        params,
-        AIR_CACHE_SECONDS,
-    )
-
-
-def format_air_quality(data):
-    if not data:
-        return {
-            "available": False,
-            "current": {},
-            "hourly": {},
-            "error": "Air-quality data is currently unavailable.",
-        }
-
-    return {
-        "available": bool(data.get("current")),
-        "current": data.get("current") or {},
-        "hourly": data.get("hourly") or {},
-        "current_units": data.get("current_units") or {},
-        "hourly_units": data.get("hourly_units") or {},
-        "timezone": data.get("timezone", ""),
-        "source": "Open-Meteo Air Quality",
-    }
+    data = api_get(AIR_QUALITY_URL, params)
+    return data.get("current")
 
 
 # ============================================================
-# Pages and health
+# MAIN PAGE
 # ============================================================
 
-@app.route("/")
+@app.get("/")
 def index():
     return render_template("index.html")
 
 
-@app.route("/api/health")
-def api_health():
-    return jsonify({
-        "status": "ok",
-        "service": "WeatherWorld Dashboard",
-        "timestamp": utc_now(),
-    })
-
-
 # ============================================================
-# Search endpoint
+# HEALTH CHECKS
 # ============================================================
 
-@app.route("/api/search")
-def api_search():
-    query = request.args.get("q", "").strip()
-    country = request.args.get("country", "").strip()
+@app.get("/api/health")
+def health():
+    try:
+        with connect_db() as db:
+            db.execute("SELECT 1").fetchone()
 
-    if not query:
         return jsonify({
-            "results": [],
-            "count": 0,
-            "query": query,
+            "status": "ok",
+            "service": "WeatherWorld",
+            "database": "ok",
+            "timestamp": utc_now(),
         })
+    except sqlite3.Error:
+        app.logger.exception("Database health check failed")
+        return error_response("Database is unavailable.", 500)
+
+
+@app.get("/api/provider-health")
+def provider_health():
+    try:
+        api_get(GEOCODING_URL, {
+            "name": "London",
+            "count": 1,
+            "language": "en",
+            "format": "json",
+        })
+        return jsonify({
+            "status": "online",
+            "provider": "Open-Meteo",
+        })
+    except (requests.RequestException, ValueError):
+        app.logger.warning("Open-Meteo health check failed", exc_info=True)
+        return jsonify({
+            "status": "offline",
+            "provider": "Open-Meteo",
+            "message": "The weather provider could not be reached.",
+        }), 503
+
+
+# ============================================================
+# CITY SEARCH
+# ============================================================
+
+@app.get("/api/search")
+def search_locations():
+    query = clean_text(request.args.get("q"), "", 100)
+
+    if len(query) < 2:
+        return jsonify({"results": []})
 
     try:
-        results = search_locations(query, country)
-
-        return jsonify({
-            "results": results,
-            "count": len(results),
-            "query": query,
+        data = api_get(GEOCODING_URL, {
+            "name": query,
+            "count": 8,
+            "language": "en",
+            "format": "json",
         })
 
-    except Exception:
-        logger.exception("Location search endpoint failed")
-        return jsonify({
-            "results": [],
-            "count": 0,
-            "query": query,
-            "error": "Location search failed. Please try again.",
-        }), 502
+        results = []
 
+        for item in data.get("results", []):
+            latitude = item.get("latitude")
+            longitude = item.get("longitude")
 
-# ============================================================
-# Weather endpoint
-# ============================================================
+            if latitude is None or longitude is None:
+                continue
 
-@app.route("/api/weather")
-def api_weather():
-    latitude = request.args.get("latitude", type=float)
-    longitude = request.args.get("longitude", type=float)
+            results.append({
+                "name": item.get("name", "Unknown"),
+                "country": item.get("country", ""),
+                "country_code": item.get("country_code", ""),
+                "admin1": item.get("admin1", ""),
+                "latitude": latitude,
+                "longitude": longitude,
+                "timezone": item.get("timezone", "auto"),
+            })
 
-    if latitude is None or longitude is None:
-        return jsonify({
-            "error": "Both latitude and longitude are required."
-        }), 400
+        return jsonify({"results": results})
 
-    if not -90 <= latitude <= 90:
-        return jsonify({"error": "Latitude must be between -90 and 90."}), 400
-
-    if not -180 <= longitude <= 180:
-        return jsonify({"error": "Longitude must be between -180 and 180."}), 400
-
-    name = request.args.get("name", "Selected location").strip()
-    country = request.args.get("country", "").strip()
-    country_code = request.args.get("country_code", "").strip().upper()
-    admin1 = request.args.get("admin1", "").strip()
-
-    try:
-        weather = fetch_weather(latitude, longitude)
+    except requests.Timeout:
+        return error_response("Location search timed out. Please try again.", 504)
     except requests.RequestException:
-        logger.exception("Weather API request failed")
-        return jsonify({
-            "error": "Could not connect to the weather service. Check your internet connection."
-        }), 502
-    except (ValueError, KeyError, TypeError):
-        logger.exception("Weather API response was invalid")
-        return jsonify({
-            "error": "The weather service returned invalid data."
-        }), 502
+        app.logger.exception("City search request failed")
+        return error_response("Location search is temporarily unavailable.", 502)
+    except ValueError:
+        app.logger.exception("Invalid city search response")
+        return error_response("The location service returned invalid data.", 502)
 
-    # AQI may fail independently; weather should still load.
+
+# ============================================================
+# CURRENT WEATHER, FORECASTS AND AIR QUALITY
+# ============================================================
+
+@app.get("/api/weather")
+def weather():
     try:
-        air_data = fetch_air_quality(latitude, longitude)
-        air_quality = format_air_quality(air_data)
-    except (requests.RequestException, ValueError, KeyError, TypeError):
-        logger.warning("Air-quality service is temporarily unavailable")
-        air_quality = format_air_quality(None)
+        location = location_from_args()
+    except ValueError as exc:
+        return error_response(str(exc), 400)
 
-    location = {
-        "name": name or "Selected location",
-        "country": country,
-        "country_code": country_code,
-        "admin1": admin1,
-        "latitude": latitude,
-        "longitude": longitude,
-        "timezone": weather.get("timezone", ""),
-        "timezone_abbreviation": weather.get("timezone_abbreviation", ""),
-        "elevation": weather.get("elevation"),
-    }
+    try:
+        data = get_forecast(
+            location["latitude"],
+            location["longitude"],
+            location["timezone"],
+        )
+    except requests.Timeout:
+        return error_response("The weather service timed out. Please retry.", 504)
+    except requests.RequestException:
+        app.logger.exception("Weather provider request failed")
+        return error_response("Could not retrieve weather data.", 502)
+    except ValueError:
+        app.logger.exception("Invalid weather response")
+        return error_response("The weather service returned invalid data.", 502)
+
+    current = data.get("current") or {}
+    hourly = data.get("hourly") or {}
+    daily = data.get("daily") or {}
+
+    description, icon = weather_description(current.get("weather_code"))
+    current["description"] = description
+    current["icon"] = icon
+
+    # Fallback for providers/responses that do not include current UV.
+    # Find the hourly value closest to the current observation time.
+    if current.get("uv_index") is None:
+        times = hourly.get("time") or []
+        uv_values = hourly.get("uv_index") or []
+        current_time = current.get("time")
+
+        if times and len(times) == len(uv_values):
+            try:
+                if current_time:
+                    target = datetime.fromisoformat(
+                        current_time.replace("Z", "+00:00")
+                    )
+                    if target.tzinfo is None:
+                        target = target.replace(tzinfo=timezone.utc)
+
+                    def time_distance(index):
+                        value = datetime.fromisoformat(
+                            times[index].replace("Z", "+00:00")
+                        )
+                        if value.tzinfo is None:
+                            value = value.replace(tzinfo=target.tzinfo)
+                        return abs((value - target).total_seconds())
+
+                    closest = min(range(len(times)), key=time_distance)
+                else:
+                    closest = 0
+
+                current["uv_index"] = uv_values[closest]
+            except (ValueError, TypeError, IndexError):
+                current["uv_index"] = None
+
+    air_quality = None
+    air_quality_error = None
+
+    try:
+        air_quality = get_air_quality(
+            location["latitude"],
+            location["longitude"],
+            location["timezone"],
+        )
+    except (requests.RequestException, ValueError):
+        air_quality_error = "Air-quality information is temporarily unavailable."
+        app.logger.warning("Air-quality request failed", exc_info=True)
 
     try:
         record_search(location)
     except sqlite3.Error:
-        # A history failure must not prevent current weather from appearing.
-        logger.exception("Could not record weather history")
+        app.logger.exception("Could not save search history")
 
     return jsonify({
         "location": location,
-        "current": weather.get("current") or {},
-        "hourly": weather.get("hourly") or {},
-        "daily": weather.get("daily") or {},
-        "units": {
-            "current": weather.get("current_units") or {},
-            "hourly": weather.get("hourly_units") or {},
-            "daily": weather.get("daily_units") or {},
-        },
+        "current": current,
+        "hourly": hourly,
+        "daily": daily,
         "air_quality": air_quality,
+        "air_quality_error": air_quality_error,
         "source": "Open-Meteo",
         "updated_at": utc_now(),
     })
 
 
 # ============================================================
-# Search history endpoint
+# SEARCH HISTORY
 # ============================================================
 
-@app.route("/api/history")
-def api_history():
-    limit = request.args.get("limit", default=20, type=int)
-    limit = max(1, min(limit or 20, 100))
-
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            rows = connection.execute("""
-                SELECT id, name, country, country_code, admin1,
-                       latitude, longitude, searched_at
-                FROM weather_history
-                ORDER BY searched_at DESC, id DESC
-                LIMIT ?
-            """, (limit,)).fetchall()
-        finally:
-            connection.close()
-
-    history = []
-
-    for row in rows:
-        item = row_location(row)
-        item["searched_at"] = row["searched_at"]
-        history.append(item)
-
-    return jsonify({
-        "history": history,
-        "count": len(history),
-    })
-
-
-# ============================================================
-# CSV export endpoint
-# ============================================================
-
-@app.route("/api/export")
-def api_export():
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            rows = connection.execute("""
-                SELECT name, country, country_code, admin1,
-                       latitude, longitude, searched_at
-                FROM weather_history
-                ORDER BY searched_at DESC, id DESC
+@app.get("/api/history")
+def get_history():
+    try:
+        with connect_db() as db:
+            rows = db.execute("""
+                SELECT id, name, country, latitude, longitude,
+                       timezone, searched_at
+                FROM search_history
+                ORDER BY id DESC
+                LIMIT 10
             """).fetchall()
-        finally:
-            connection.close()
 
-    output = io.StringIO()
-    writer = csv.writer(output)
+        return jsonify({"results": [dict(row) for row in rows]})
 
-    writer.writerow([
-        "Location",
-        "Country",
-        "Country Code",
-        "State or Region",
-        "Latitude",
-        "Longitude",
-        "Searched At (UTC)",
-    ])
+    except sqlite3.Error:
+        app.logger.exception("Could not retrieve search history")
+        return error_response("Could not retrieve search history.", 500)
 
-    for row in rows:
-        writer.writerow([
-            row["name"],
-            row["country"],
-            row["country_code"],
-            row["admin1"],
-            row["latitude"],
-            row["longitude"],
-            row["searched_at"],
-        ])
 
-    return Response(
-        "\ufeff" + output.getvalue(),
-        mimetype="text/csv; charset=utf-8",
-        headers={
-            "Content-Disposition":
-                'attachment; filename="weather-history.csv"'
-        },
-    )
+@app.delete("/api/history")
+def clear_history():
+    try:
+        with connect_db() as db:
+            db.execute("DELETE FROM search_history")
+            db.commit()
+
+        return jsonify({"message": "Search history cleared."})
+
+    except sqlite3.Error:
+        app.logger.exception("Could not clear search history")
+        return error_response("Could not clear search history.", 500)
 
 
 # ============================================================
-# Favorites: list
+# FAVORITES
 # ============================================================
 
-@app.route("/api/favorites", methods=["GET"])
-def api_get_favorites():
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            rows = connection.execute("""
-                SELECT id, name, country, country_code, admin1,
-                       latitude, longitude, created_at
+@app.get("/api/favorites")
+def get_favorites():
+    try:
+        with connect_db() as db:
+            rows = db.execute("""
+                SELECT id, name, country, latitude, longitude,
+                       timezone, created_at
                 FROM favorites
-                ORDER BY created_at DESC, id DESC
+                ORDER BY name COLLATE NOCASE ASC
             """).fetchall()
-        finally:
-            connection.close()
 
-    favorites = []
+        return jsonify({"results": [dict(row) for row in rows]})
 
-    for row in rows:
-        item = row_location(row)
-        item["created_at"] = row["created_at"]
-        favorites.append(item)
-
-    return jsonify({
-        "favorites": favorites,
-        "count": len(favorites),
-    })
+    except sqlite3.Error:
+        app.logger.exception("Could not retrieve favorites")
+        return error_response("Could not retrieve favorite locations.", 500)
 
 
-# ============================================================
-# Favorites: add
-# ============================================================
+@app.post("/api/favorites")
+def add_favorite():
+    body = request.get_json(silent=True)
 
-@app.route("/api/favorites", methods=["POST"])
-def api_add_favorite():
-    data = request.get_json(silent=True) or {}
-
-    name = str(data.get("name", "")).strip() or "Saved location"
-    country = str(data.get("country", "")).strip()
-    country_code = str(data.get("country_code", "")).strip().upper()
-    admin1 = str(data.get("admin1", "")).strip()
+    if not isinstance(body, dict):
+        return error_response("A JSON location object is required.", 400)
 
     try:
-        latitude = float(data.get("latitude", data.get("lat")))
-        longitude = float(data.get("longitude", data.get("lon")))
-    except (ValueError, TypeError):
-        return jsonify({
-            "error": "Valid latitude and longitude are required."
-        }), 400
+        location = location_from_json(body)
+    except ValueError as exc:
+        return error_response(str(exc), 400)
 
-    if not (-90 <= latitude <= 90 and -180 <= longitude <= 180):
-        return jsonify({"error": "Coordinates are outside valid ranges."}), 400
-
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            existing = connection.execute("""
+    try:
+        with connect_db() as db:
+            existing = db.execute("""
                 SELECT id FROM favorites
-                WHERE ABS(latitude - ?) < 0.001
-                  AND ABS(longitude - ?) < 0.001
-                LIMIT 1
-            """, (latitude, longitude)).fetchone()
+                WHERE latitude = ? AND longitude = ?
+            """, (
+                location["latitude"],
+                location["longitude"],
+            )).fetchone()
 
             if existing:
                 return jsonify({
-                    "success": True,
-                    "message": "Location is already in favorites.",
+                    "message": "This location is already a favorite.",
                     "id": existing["id"],
                 })
 
-            cursor = connection.execute("""
+            cursor = db.execute("""
                 INSERT INTO favorites
-                    (name, country, country_code, admin1,
-                     latitude, longitude, created_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
+                    (name, country, latitude, longitude, timezone, created_at)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (
-                name,
-                country,
-                country_code,
-                admin1,
-                latitude,
-                longitude,
+                location["name"],
+                location["country"],
+                location["latitude"],
+                location["longitude"],
+                location["timezone"],
                 utc_now(),
             ))
+            db.commit()
 
-            connection.commit()
+        return jsonify({
+            "message": "Location saved to favorites.",
+            "id": cursor.lastrowid,
+            "location": location,
+        }), 201
 
-            return jsonify({
-                "success": True,
-                "message": "Favorite saved.",
-                "id": cursor.lastrowid,
-            }), 201
-
-        except sqlite3.Error:
-            connection.rollback()
-            logger.exception("Could not save favorite")
-            return jsonify({"error": "Could not save this favorite."}), 500
-
-        finally:
-            connection.close()
+    except sqlite3.IntegrityError:
+        return error_response("This location is already saved.", 409)
+    except sqlite3.Error:
+        app.logger.exception("Could not save favorite")
+        return error_response("Could not save this favorite.", 500)
 
 
-# ============================================================
-# Favorites: delete
-# ============================================================
+@app.delete("/api/favorites/<int:favorite_id>")
+def delete_favorite(favorite_id):
+    try:
+        with connect_db() as db:
+            cursor = db.execute(
+                "DELETE FROM favorites WHERE id = ?",
+                (favorite_id,),
+            )
+            db.commit()
 
-@app.route("/api/favorites", methods=["DELETE"])
-def api_delete_favorite():
-    data = request.get_json(silent=True) or {}
+        if cursor.rowcount == 0:
+            return error_response("Favorite location not found.", 404)
 
-    favorite_id = data.get("id")
-    name = str(data.get("name", "")).strip()
-    latitude = data.get("latitude", data.get("lat"))
-    longitude = data.get("longitude", data.get("lon"))
+        return jsonify({"message": "Favorite removed."})
 
-    with _db_lock:
-        connection = get_db()
-
-        try:
-            if favorite_id is not None:
-                connection.execute(
-                    "DELETE FROM favorites WHERE id = ?",
-                    (favorite_id,),
-                )
-
-            elif latitude is not None and longitude is not None:
-                try:
-                    latitude = float(latitude)
-                    longitude = float(longitude)
-                except (ValueError, TypeError):
-                    return jsonify({
-                        "error": "Invalid coordinates."
-                    }), 400
-
-                connection.execute("""
-                    DELETE FROM favorites
-                    WHERE ABS(latitude - ?) < 0.001
-                      AND ABS(longitude - ?) < 0.001
-                """, (latitude, longitude))
-
-            elif name:
-                connection.execute(
-                    "DELETE FROM favorites WHERE name = ?",
-                    (name,),
-                )
-
-            else:
-                return jsonify({
-                    "error": "Provide a favorite ID or location coordinates."
-                }), 400
-
-            connection.commit()
-
-            return jsonify({
-                "success": True,
-                "message": "Favorite removed if it existed.",
-            })
-
-        except sqlite3.Error:
-            connection.rollback()
-            logger.exception("Could not delete favorite")
-            return jsonify({"error": "Could not remove this favorite."}), 500
-
-        finally:
-            connection.close()
+    except sqlite3.Error:
+        app.logger.exception("Could not delete favorite")
+        return error_response("Could not remove favorite.", 500)
 
 
 # ============================================================
-# Search diagnostics
+# CSV EXPORT
 # ============================================================
 
-@app.route("/api/search-debug")
-def api_search_debug():
-    query = request.args.get("q", "").strip()
+@app.get("/api/export")
+def export_history():
+    try:
+        with connect_db() as db:
+            rows = db.execute("""
+                SELECT name, country, latitude, longitude,
+                       timezone, searched_at
+                FROM search_history
+                ORDER BY id DESC
+            """).fetchall()
 
-    if not query:
-        return jsonify({"error": "Pass a query using ?q=..."}), 400
+        output = io.StringIO(newline="")
+        writer = csv.writer(output)
 
-    search_name, country_code, country_name = split_location_query(query)
-    queries = make_queries(search_name or query, country_name)
+        writer.writerow([
+            "Location",
+            "Country",
+            "Latitude",
+            "Longitude",
+            "Timezone",
+            "Searched At",
+        ])
 
-    attempts = []
+        for row in rows:
+            writer.writerow([
+                row["name"],
+                row["country"],
+                row["latitude"],
+                row["longitude"],
+                row["timezone"],
+                row["searched_at"],
+            ])
 
-    for candidate in queries[:4]:
-        results = search_open_meteo(candidate, country_code)
+        return Response(
+            "\ufeff" + output.getvalue(),
+            mimetype="text/csv; charset=utf-8",
+            headers={
+                "Content-Disposition":
+                    "attachment; filename=weather_history.csv",
+                "Cache-Control": "no-store",
+            },
+        )
 
-        attempts.append({
-            "query": candidate,
-            "provider": "Open-Meteo",
-            "count": len(results),
-            "results": results[:5],
-        })
-
-        if not results:
-            osm_results = search_nominatim(candidate, country_code)
-
-            attempts.append({
-                "query": candidate,
-                "provider": "OpenStreetMap Nominatim",
-                "count": len(osm_results),
-                "results": osm_results[:5],
-            })
-
-    return jsonify({
-        "query": query,
-        "search_name": search_name,
-        "country_code": country_code,
-        "attempts": attempts,
-    })
+    except sqlite3.Error:
+        app.logger.exception("Could not export search history")
+        return error_response("Could not export search history.", 500)
 
 
 # ============================================================
-# Initialize database and run
+# ERROR HANDLERS
 # ============================================================
 
-# If initialization fails, the complete SQLite error is logged in the
-# terminal rather than being silently ignored.
-init_db()
+@app.errorhandler(404)
+def not_found(error):
+    if request.path.startswith("/api/"):
+        return error_response("API endpoint not found.", 404)
+    return "Page not found.", 404
+
+
+@app.errorhandler(405)
+def method_not_allowed(error):
+    return error_response("HTTP method not allowed.", 405)
+
+
+@app.errorhandler(413)
+def request_too_large(error):
+    return error_response("Request payload is too large.", 413)
+
+
+@app.errorhandler(500)
+def internal_server_error(error):
+    app.logger.error("Unhandled application error: %s", error)
+    return error_response("An internal server error occurred.", 500)
+
+
+# ============================================================
+# INITIALIZATION
+# ============================================================
+
+initialize_database()
+app.logger.info("WeatherWorld database initialized.")
 
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5000"))
-    debug = os.environ.get("FLASK_DEBUG", "0") == "1"
-
-    app.run(
-        host="127.0.0.1",
-        port=port,
-        debug=debug,
-        threaded=True,
-    )
+    app.run(host="0.0.0.0", port=port, debug=False)

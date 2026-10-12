@@ -1,1107 +1,1523 @@
 
 "use strict";
 
+/* =========================================================
+   WEATHERWORLD — COMPLETE FRONTEND
+   Compatible with app.py and templates/index.html
+   ========================================================= */
+
+const $ = (id) => document.getElementById(id);
+
 const API = {
     health: "/api/health",
+    providerHealth: "/api/provider-health",
     search: "/api/search",
     weather: "/api/weather",
+    favorites: "/api/favorites",
     history: "/api/history",
-    export: "/api/export",
-    favorites: "/api/favorites"
+    export: "/api/export"
 };
 
-const $ = (selector) => document.querySelector(selector);
+const DEFAULT_LOCATION = {
+    name: "Kadapa",
+    country: "India",
+    latitude: 14.46795,
+    longitude: 78.82346,
+    timezone: "Asia/Kolkata"
+};
+
+const WEATHER_CODES = {
+    0: ["Clear sky", "☀️"],
+    1: ["Mainly clear", "🌤️"],
+    2: ["Partly cloudy", "⛅"],
+    3: ["Overcast", "☁️"],
+    45: ["Fog", "🌫️"],
+    48: ["Depositing rime fog", "🌫️"],
+    51: ["Light drizzle", "🌦️"],
+    53: ["Moderate drizzle", "🌦️"],
+    55: ["Dense drizzle", "🌧️"],
+    56: ["Light freezing drizzle", "🌧️"],
+    57: ["Dense freezing drizzle", "🌧️"],
+    61: ["Slight rain", "🌦️"],
+    63: ["Moderate rain", "🌧️"],
+    65: ["Heavy rain", "🌧️"],
+    66: ["Light freezing rain", "🌧️"],
+    67: ["Heavy freezing rain", "🌧️"],
+    71: ["Slight snowfall", "🌨️"],
+    73: ["Moderate snowfall", "🌨️"],
+    75: ["Heavy snowfall", "❄️"],
+    77: ["Snow grains", "🌨️"],
+    80: ["Slight rain showers", "🌦️"],
+    81: ["Moderate rain showers", "🌧️"],
+    82: ["Violent rain showers", "⛈️"],
+    85: ["Slight snow showers", "🌨️"],
+    86: ["Heavy snow showers", "❄️"],
+    95: ["Thunderstorm", "⛈️"],
+    96: ["Thunderstorm with hail", "⛈️"],
+    99: ["Thunderstorm with heavy hail", "⛈️"]
+};
 
 const state = {
-    location: null,
-    weather: null,
-    unit: "celsius",
-    dark: false,
+    location: { ...DEFAULT_LOCATION },
+    weatherData: null,
+    useFahrenheit: false,
+    darkMode: false,
     favorites: [],
     history: [],
-    suggestions: [],
     map: null,
-    marker: null,
-    mapReady: false,
+    mapMarker: null,
     searchTimer: null,
-    toastTimer: null,
-    requestId: 0
+    searchRequestId: 0,
+    weatherRequestId: 0,
+    searchAbortController: null,
+    weatherAbortController: null,
+    lastSearchResults: []
 };
 
-const el = {
-    searchForm: $("#searchForm"),
-    locationInput: $("#locationInput"),
-    searchButton: $("#searchButton"),
-    suggestions: $("#suggestions"),
-    currentLocationButton: $("#currentLocationButton"),
-    coordinateToggle: $("#coordinateToggle"),
-    coordinateForm: $("#coordinateForm"),
-    latitudeInput: $("#latitudeInput"),
-    longitudeInput: $("#longitudeInput"),
-    unitToggle: $("#unitToggle"),
-    themeToggle: $("#themeToggle"),
-    statusMessage: $("#statusMessage"),
-    currentWeather: $("#currentWeather"),
-    hourlyForecast: $("#hourlyForecast"),
-    dailyForecast: $("#dailyForecast"),
-    favoriteButton: $("#favoriteButton"),
-    favoritesList: $("#favoritesList"),
-    historyList: $("#historyList"),
-    refreshHistoryButton: $("#refreshHistoryButton"),
-    exportButton: $("#exportButton"),
-    loadingOverlay: $("#loadingOverlay"),
-    toast: $("#toast"),
-    apiStatusDot: $("#apiStatusDot"),
-    apiStatusText: $("#apiStatusText"),
-    coordinatesDisplay: $("#coordinatesDisplay"),
-    airQualityStatus: $("#airQualityStatus"),
-    airSummary: $("#airSummary"),
-    airDetail: $("#airDetail")
-};
+/* =========================================================
+   GENERAL HELPERS
+   ========================================================= */
 
-/* -------------------- Helpers -------------------- */
-
-function escapeHTML(value) {
-    return String(value ?? "").replace(/[&<>"']/g, char => ({
-        "&": "&amp;",
-        "<": "&lt;",
-        ">": "&gt;",
-        '"': "&quot;",
-        "'": "&#39;"
-    })[char]);
-}
-
-function valueFrom(object, ...keys) {
-    for (const key of keys) {
-        if (object && object[key] !== undefined && object[key] !== null) {
-            return object[key];
-        }
+function finiteNumber(value) {
+    if (value === null || value === undefined || value === "") {
+        return null;
     }
-    return null;
+
+    const number = Number(value);
+    return Number.isFinite(number) ? number : null;
 }
 
-function asNumber(value) {
-    if (value === null || value === undefined || value === "") return null;
-    const result = Number(value);
-    return Number.isFinite(result) ? result : null;
+function numberText(value, decimals = 0) {
+    const number = finiteNumber(value);
+    if (number === null) return "—";
+
+    return number.toLocaleString(undefined, {
+        maximumFractionDigits: decimals
+    });
 }
 
-function fmt(value, digits = 0) {
-    const number = asNumber(value);
-    return number === null ? "—" : number.toFixed(digits);
+function setText(id, value) {
+    const element = $(id);
+    if (element) element.textContent = value;
 }
 
-function asArray(value) {
-    return Array.isArray(value) ? value : [];
+function showElement(element) {
+    if (element) element.classList.remove("hidden");
 }
 
-function responseItems(data, ...keys) {
-    if (Array.isArray(data)) return data;
-    for (const key of keys) {
-        if (Array.isArray(data?.[key])) return data[key];
+function hideElement(element) {
+    if (element) element.classList.add("hidden");
+}
+
+function showLoading(show) {
+    const overlay = $("loadingOverlay");
+    if (!overlay) return;
+
+    overlay.classList.toggle("hidden", !show);
+}
+
+function showError(message) {
+    const error = $("errorBanner");
+
+    if (error) {
+        error.textContent = message;
+        showElement(error);
     }
-    return [];
+
+    hideElement($("successBanner"));
 }
 
-function normalizeLocation(item = {}) {
-    return {
-        id: item.id ?? null,
-        name: String(valueFrom(item, "name", "city", "display_name") || "Unknown location"),
-        country: String(valueFrom(item, "country", "country_name") || ""),
-        country_code: String(valueFrom(item, "country_code", "countryCode") || ""),
-        admin1: String(valueFrom(item, "admin1", "state", "region") || ""),
-        admin2: String(valueFrom(item, "admin2", "district", "county") || ""),
-        latitude: asNumber(valueFrom(item, "latitude", "lat")),
-        longitude: asNumber(valueFrom(item, "longitude", "lon", "lng")),
-        timezone: String(item.timezone || ""),
-        source: item.source || ""
-    };
+function showSuccess(message) {
+    const success = $("successBanner");
+
+    if (success) {
+        success.textContent = message;
+        showElement(success);
+    }
+
+    hideElement($("errorBanner"));
 }
 
-function locationLabel(location) {
-    if (!location) return "Unknown location";
-    return [...new Set([
-        location.name,
-        location.admin1,
-        location.country
-    ].filter(Boolean))].join(", ");
+function clearMessages() {
+    hideElement($("errorBanner"));
+    hideElement($("successBanner"));
 }
 
-function showToast(message, type = "info") {
-    if (!el.toast) return;
-    el.toast.textContent = message;
-    el.toast.className = `toast toast-${type}`;
-    el.toast.classList.remove("hidden");
+function setStatus(online, message) {
+    setText("topStatusText", message);
 
-    clearTimeout(state.toastTimer);
-    state.toastTimer = setTimeout(() => el.toast.classList.add("hidden"), 3500);
-}
-
-function showStatus(message, type = "info") {
-    if (!el.statusMessage) return;
-    el.statusMessage.textContent = message;
-    el.statusMessage.className = `status-message status-${type}`;
-    el.statusMessage.classList.remove("hidden");
-}
-
-function clearStatus() {
-    el.statusMessage?.classList.add("hidden");
-}
-
-function setLoading(loading) {
-    el.loadingOverlay?.classList.toggle("hidden", !loading);
-
-    if (el.searchButton) {
-        el.searchButton.disabled = loading;
-        el.searchButton.innerHTML = loading ? "Loading…" : 'Search <span>→</span>';
+    const dot = $("topStatusDot");
+    if (dot) {
+        dot.classList.toggle("online", online);
+        dot.classList.toggle("offline", !online);
     }
 }
 
-async function apiRequest(url, options = {}) {
-    const config = {
-        method: options.method || "GET",
+function setProviderStatus(online, message) {
+    setText("providerStatusText", message);
+
+    const dot = $("providerStatusDot");
+    if (dot) {
+        dot.classList.toggle("online", online);
+        dot.classList.toggle("offline", !online);
+    }
+}
+
+async function apiFetch(url, options = {}) {
+    const response = await fetch(url, {
+        ...options,
         headers: {
-            Accept: "application/json",
             ...(options.body ? { "Content-Type": "application/json" } : {}),
             ...(options.headers || {})
-        },
-        ...(options.body ? { body: options.body } : {})
-    };
-
-    const response = await fetch(url, config);
-    const contentType = response.headers.get("content-type") || "";
+        }
+    });
 
     let data;
-    if (contentType.includes("application/json")) {
+
+    try {
         data = await response.json();
-    } else {
-        data = await response.text();
+    } catch {
+        throw new Error(`The server returned an invalid response (${response.status}).`);
     }
 
     if (!response.ok) {
-        const message = typeof data === "object"
-            ? data.error || data.message || `Request failed (${response.status})`
-            : data || `Request failed (${response.status})`;
-        throw new Error(message);
+        throw new Error(data.error || `Request failed (${response.status}).`);
     }
 
     return data;
 }
 
-function isFahrenheit() {
-    return state.unit === "fahrenheit";
+function makeQuery(location) {
+    const params = new URLSearchParams({
+        name: location.name || "Selected location",
+        country: location.country || "",
+        latitude: String(location.latitude),
+        longitude: String(location.longitude),
+        timezone: location.timezone || "auto"
+    });
+
+    return params.toString();
 }
 
-function temperature(value) {
-    let number = asNumber(value);
+function localLocationName(location) {
+    return [location.name, location.admin1, location.country]
+        .filter(Boolean)
+        .filter((value, index, array) => array.indexOf(value) === index)
+        .join(", ");
+}
+
+function weatherCodeInfo(code) {
+    return WEATHER_CODES[Number(code)] || ["Unknown conditions", "🌡️"];
+}
+
+function temperatureValue(value) {
+    const number = finiteNumber(value);
+    if (number === null) return "—°";
+
+    const result = state.useFahrenheit
+        ? (number * 9 / 5) + 32
+        : number;
+
+    return `${Math.round(result)}°`;
+}
+
+function windSpeedValue(value) {
+    const number = finiteNumber(value);
     if (number === null) return "—";
-    if (isFahrenheit()) number = number * 9 / 5 + 32;
-    return `${Math.round(number)}°${isFahrenheit() ? "F" : "C"}`;
+
+    const speed = state.useFahrenheit
+        ? number / 1.609344
+        : number;
+
+    return `${numberText(speed, 1)} ${state.useFahrenheit ? "mph" : "km/h"}`;
 }
 
-function windSpeed(value) {
-    const number = asNumber(value);
-    return number === null ? "—" : `${Math.round(number)} km/h`;
+function degreesToDirection(degrees) {
+    const number = finiteNumber(degrees);
+    if (number === null) return "—";
+
+    const directions = [
+        "N", "NNE", "NE", "ENE",
+        "E", "ESE", "SE", "SSE",
+        "S", "SSW", "SW", "WSW",
+        "W", "WNW", "NW", "NNW"
+    ];
+
+    return directions[Math.round(number / 22.5) % 16];
 }
 
-function timeLabel(value, options = {}) {
+function formatTime(value, timezone) {
     if (!value) return "—";
+
+    const date = new Date(value);
+
+    if (Number.isNaN(date.getTime())) {
+        const match = String(value).match(/T(\d{2}:\d{2})/);
+        return match ? match[1] : String(value);
+    }
+
+    try {
+        return new Intl.DateTimeFormat([], {
+            hour: "numeric",
+            minute: "2-digit",
+            timeZone: timezone && timezone !== "auto" ? timezone : undefined
+        }).format(date);
+    } catch {
+        return date.toLocaleTimeString([], {
+            hour: "numeric",
+            minute: "2-digit"
+        });
+    }
+}
+
+function formatDateTime(value) {
+    if (!value) return "—";
+
     const date = new Date(value);
     if (Number.isNaN(date.getTime())) return String(value);
 
-    return new Intl.DateTimeFormat(undefined, {
-        hour: "numeric",
-        minute: "2-digit",
-        ...options
-    }).format(date);
-}
-
-function dayLabel(value) {
-    if (!value) return "—";
-    const date = new Date(`${String(value).slice(0, 10)}T12:00:00`);
-    if (Number.isNaN(date.getTime())) return String(value);
-
-    return new Intl.DateTimeFormat(undefined, {
-        weekday: "short",
+    return date.toLocaleString([], {
         month: "short",
-        day: "numeric"
-    }).format(date);
+        day: "numeric",
+        hour: "numeric",
+        minute: "2-digit"
+    });
 }
 
-function weatherInfo(code) {
-    const map = {
-        0: ["Clear sky", "☀️"],
-        1: ["Mainly clear", "🌤️"],
-        2: ["Partly cloudy", "⛅"],
-        3: ["Overcast", "☁️"],
-        45: ["Fog", "🌫️"],
-        48: ["Rime fog", "🌫️"],
-        51: ["Light drizzle", "🌦️"],
-        53: ["Drizzle", "🌦️"],
-        55: ["Heavy drizzle", "🌧️"],
-        56: ["Freezing drizzle", "🌧️"],
-        57: ["Heavy freezing drizzle", "🌧️"],
-        61: ["Light rain", "🌦️"],
-        63: ["Moderate rain", "🌧️"],
-        65: ["Heavy rain", "🌧️"],
-        66: ["Freezing rain", "🌧️"],
-        67: ["Heavy freezing rain", "🌧️"],
-        71: ["Light snow", "🌨️"],
-        73: ["Snow", "❄️"],
-        75: ["Heavy snow", "❄️"],
-        77: ["Snow grains", "🌨️"],
-        80: ["Rain showers", "🌦️"],
-        81: ["Moderate showers", "🌧️"],
-        82: ["Heavy showers", "⛈️"],
-        85: ["Snow showers", "🌨️"],
-        86: ["Heavy snow showers", "❄️"],
-        95: ["Thunderstorm", "⛈️"],
-        96: ["Thunderstorm with hail", "⛈️"],
-        99: ["Severe thunderstorm", "⛈️"]
-    };
+function formatForecastDay(value, timezone) {
+    if (!value) return "—";
 
-    return map[asNumber(code)] || ["Weather unavailable", "🌡️"];
-}
+    const match = String(value).match(/^(\d{4})-(\d{2})-(\d{2})$/);
 
-/* -------------------- Search -------------------- */
+    if (match) {
+        const date = new Date(Date.UTC(
+            Number(match[1]),
+            Number(match[2]) - 1,
+            Number(match[3]),
+            12
+        ));
 
-function parseCountrySuffix(query) {
-    const parts = query.split(",").map(part => part.trim()).filter(Boolean);
-    if (parts.length < 2) return { query, country: "" };
-
-    return {
-        query,
-        country: parts[parts.length - 1]
-    };
-}
-
-async function searchLocations(query) {
-    const parsed = parseCountrySuffix(query);
-    const url = new URL(API.search, window.location.origin);
-    url.searchParams.set("q", query);
-
-    // The backend parses country names in q itself. Supplying this parameter
-    // also supports an explicit country filter when one was typed.
-    if (parsed.country) url.searchParams.set("country", parsed.country);
-
-    const data = await apiRequest(url.toString());
-    return responseItems(data, "results", "locations", "items")
-        .map(normalizeLocation)
-        .filter(item => item.latitude !== null && item.longitude !== null);
-}
-
-function renderSuggestions(locations) {
-    state.suggestions = locations;
-
-    if (!el.suggestions) return;
-
-    if (!locations.length) {
-        el.suggestions.innerHTML = `
-            <div class="suggestion-empty">
-                <strong>No matching locations found</strong>
-                <span>Try adding a country, state, or district.</span>
-            </div>`;
-        el.suggestions.classList.remove("hidden");
-        return;
+        return new Intl.DateTimeFormat([], {
+            weekday: "short",
+            month: "short",
+            day: "numeric",
+            timeZone: "UTC"
+        }).format(date);
     }
 
-    el.suggestions.innerHTML = locations.slice(0, 8).map((location, index) => `
-        <button type="button" class="suggestion-item" data-suggestion-index="${index}" role="option">
-            <span class="suggestion-pin">⌖</span>
-            <span class="suggestion-text">
-                <strong>${escapeHTML(location.name)}</strong>
-                <small>${escapeHTML([location.admin1, location.admin2, location.country].filter(Boolean).join(", "))}</small>
-            </span>
-            <span class="suggestion-arrow">↗</span>
-        </button>
-    `).join("");
-
-    el.suggestions.classList.remove("hidden");
+    return String(value);
 }
 
-function hideSuggestions() {
-    el.suggestions?.classList.add("hidden");
+function sameCoordinates(first, second) {
+    if (!first || !second) return false;
+
+    return (
+        Math.abs(Number(first.latitude) - Number(second.latitude)) < 0.00001 &&
+        Math.abs(Number(first.longitude) - Number(second.longitude)) < 0.00001
+    );
 }
 
-async function autocomplete() {
-    clearTimeout(state.searchTimer);
+/* =========================================================
+   CURRENT WEATHER AND UV INDEX
+   ========================================================= */
 
-    const query = el.locationInput?.value.trim() || "";
-    if (query.length < 2) {
-        hideSuggestions();
-        return;
-    }
+function findCurrentUV(current, hourly) {
+    const currentUV = finiteNumber(current?.uv_index);
+    if (currentUV !== null) return currentUV;
 
-    state.searchTimer = setTimeout(async () => {
-        try {
-            const results = await searchLocations(query);
-            renderSuggestions(results);
-        } catch (error) {
-            renderSuggestions([]);
+    const values = hourly?.uv_index;
+    const times = hourly?.time;
+
+    if (!Array.isArray(values) || !values.length) return null;
+
+    const currentTime = current?.time;
+
+    if (currentTime && Array.isArray(times) && times.length === values.length) {
+        const target = new Date(currentTime).getTime();
+
+        if (Number.isFinite(target)) {
+            let closestIndex = -1;
+            let closestDistance = Infinity;
+
+            times.forEach((time, index) => {
+                const timeValue = new Date(time).getTime();
+                if (!Number.isFinite(timeValue)) return;
+
+                const distance = Math.abs(timeValue - target);
+
+                if (distance < closestDistance) {
+                    closestDistance = distance;
+                    closestIndex = index;
+                }
+            });
+
+            // Do not use a distant hourly value as the current UV.
+            if (closestIndex >= 0 && closestDistance <= 90 * 60 * 1000) {
+                return finiteNumber(values[closestIndex]);
+            }
         }
-    }, 450);
+    }
+
+    return null;
 }
 
-async function searchByText(query) {
-    query = String(query || "").trim();
-    if (!query) {
-        showToast("Enter a city, town, village, or country.", "error");
-        return;
-    }
+function renderCurrent(current, daily) {
+    const weather = current || {};
+    const [description, icon] = weatherCodeInfo(weather.weather_code);
 
-    setLoading(true);
-    clearStatus();
-    hideSuggestions();
+    setText("locationLabel", localLocationName(state.location));
+    setText("currentTemperature", temperatureValue(weather.temperature_2m));
+    setText("currentDescription", weather.description || description);
 
-    try {
-        let results = await searchLocations(query);
-
-        // If a country-qualified search fails, try the place name separately.
-        // The backend still applies its own country filtering when available.
-        if (!results.length && query.includes(",")) {
-            const shorterQuery = query.split(",").slice(0, -1).join(",").trim();
-            if (shorterQuery) results = await searchLocations(shorterQuery);
-        }
-
-        if (!results.length) {
-            throw new Error(
-                `No locations found for "${query}". Try adding the state, district, or a nearby larger town.`
-            );
-        }
-
-        await loadWeather(results[0]);
-    } catch (error) {
-        showStatus(error.message || "Location search failed.", "error");
-    } finally {
-        setLoading(false);
-    }
-}
-
-async function searchByCoordinates(latitude, longitude) {
-    const lat = asNumber(latitude);
-    const lon = asNumber(longitude);
-
-    if (lat === null || lat < -90 || lat > 90) {
-        showToast("Latitude must be between -90 and 90.", "error");
-        return;
-    }
-
-    if (lon === null || lon < -180 || lon > 180) {
-        showToast("Longitude must be between -180 and 180.", "error");
-        return;
-    }
-
-    try {
-        await loadWeather({
-            name: "Selected coordinates",
-            country: "",
-            latitude: lat,
-            longitude: lon
-        });
-    } catch (error) {
-        showToast(error.message || "Could not load weather for these coordinates.", "error");
-    }
-}
-
-/* -------------------- Weather API -------------------- */
-
-async function loadWeather(locationInput) {
-    const location = normalizeLocation(locationInput);
-
-    if (location.latitude === null || location.longitude === null) {
-        throw new Error("The selected location does not contain valid coordinates.");
-    }
-
-    const id = ++state.requestId;
-    setLoading(true);
-    clearStatus();
-    hideSuggestions();
-
-    try {
-        const url = new URL(API.weather, window.location.origin);
-        url.searchParams.set("latitude", location.latitude);
-        url.searchParams.set("longitude", location.longitude);
-        url.searchParams.set("name", location.name);
-
-        if (location.country) url.searchParams.set("country", location.country);
-        if (location.country_code) {
-            url.searchParams.set("country_code", location.country_code);
-        }
-
-        const result = await apiRequest(url.toString());
-
-        if (id !== state.requestId) return;
-
-        state.location = normalizeLocation({
-            ...location,
-            ...(result.location || {})
-        });
-        state.weather = result;
-
-        if (el.locationInput) {
-            el.locationInput.value = locationLabel(state.location);
-        }
-
-        renderCurrentWeather(result);
-        renderHourlyForecast(result);
-        renderDailyForecast(result);
-        renderAirQuality(result.air_quality);
-        updateMap(state.location);
-        updateFavoriteButton();
-
-        showStatus(`Weather updated for ${locationLabel(state.location)}.`, "success");
-
-        await Promise.all([loadHistory(), loadFavorites()]);
-    } catch (error) {
-        if (id === state.requestId) {
-            showStatus(error.message || "Unable to load weather.", "error");
-        }
-        throw error;
-    } finally {
-        if (id === state.requestId) setLoading(false);
-    }
-}
-
-/* -------------------- Current weather -------------------- */
-
-function renderCurrentWeather(result) {
-    const location = state.location;
-    const current = result.current || {};
-    const [description, icon] = weatherInfo(
-        valueFrom(current, "weather_code", "weathercode")
+    const apparent = finiteNumber(weather.apparent_temperature);
+    setText(
+        "feelsLike",
+        apparent === null ? "—" : temperatureValue(apparent)
     );
 
-    const humidity = valueFrom(current, "relative_humidity_2m", "humidity");
-    const wind = valueFrom(current, "wind_speed_10m", "wind_speed");
-    const windDirection = valueFrom(current, "wind_direction_10m", "wind_direction");
-    const pressure = valueFrom(current, "surface_pressure", "pressure_msl");
-    const cloudCover = valueFrom(current, "cloud_cover", "cloudcover");
-    const feelsLike = valueFrom(current, "apparent_temperature", "feels_like");
-    const updateTime = valueFrom(current, "time") || result.updated_at;
+    const iconElement = $("currentIcon");
 
-    el.currentWeather.innerHTML = `
-        <div class="current-main">
-            <div class="current-place">
-                <span class="place-pin">⌖</span>
-                <div>
-                    <h3>${escapeHTML(locationLabel(location))}</h3>
-                    <p>${updateTime ? `Updated ${escapeHTML(timeLabel(updateTime))}` : "Current conditions"}</p>
-                </div>
-            </div>
-            <div class="current-condition">
-                <span class="weather-emoji" aria-hidden="true">${icon}</span>
-                <div>
-                    <div class="current-temperature">${temperature(current.temperature_2m)}</div>
-                    <p>${escapeHTML(description)}</p>
-                    <small>Feels like ${temperature(feelsLike)}</small>
-                </div>
-            </div>
-        </div>
+    if (iconElement) {
+        iconElement.textContent = weather.icon || icon;
+        iconElement.setAttribute("aria-label", weather.description || description);
+    }
 
-        <div class="weather-metrics">
-            <div class="metric-card"><span class="metric-icon">💧</span><span class="metric-label">Humidity</span><strong>${humidity == null ? "—" : `${fmt(humidity)}%`}</strong></div>
-            <div class="metric-card"><span class="metric-icon">💨</span><span class="metric-label">Wind speed</span><strong>${windSpeed(wind)}</strong></div>
-            <div class="metric-card"><span class="metric-icon">🧭</span><span class="metric-label">Wind direction</span><strong>${windDirection == null ? "—" : `${fmt(windDirection)}°`}</strong></div>
-            <div class="metric-card"><span class="metric-icon">◉</span><span class="metric-label">Pressure</span><strong>${pressure == null ? "—" : `${fmt(pressure)} hPa`}</strong></div>
-            <div class="metric-card"><span class="metric-icon">☁</span><span class="metric-label">Cloud cover</span><strong>${cloudCover == null ? "—" : `${fmt(cloudCover)}%`}</strong></div>
-            <div class="metric-card"><span class="metric-icon">🌐</span><span class="metric-label">Coordinates</span><strong class="coordinate-metric">${location.latitude.toFixed(3)}, ${location.longitude.toFixed(3)}</strong></div>
-        </div>
-    `;
+    setText(
+        "humidity",
+        weather.relative_humidity_2m == null
+            ? "—"
+            : `${numberText(weather.relative_humidity_2m)}%`
+    );
+
+    setText("windSpeed", windSpeedValue(weather.wind_speed_10m));
+    setText("windDirection", degreesToDirection(weather.wind_direction_10m));
+
+    setText(
+        "pressure",
+        weather.pressure_msl == null
+            ? "—"
+            : `${numberText(weather.pressure_msl)} hPa`
+    );
+
+    setText(
+        "cloudCover",
+        weather.cloud_cover == null
+            ? "—"
+            : `${numberText(weather.cloud_cover)}%`
+    );
+
+    setText(
+        "precipitation",
+        weather.precipitation == null
+            ? "—"
+            : `${numberText(weather.precipitation, 1)} mm`
+    );
+
+    const high = daily?.temperature_2m_max?.[0];
+    const low = daily?.temperature_2m_min?.[0];
+
+    setText("todayHigh", high == null ? "—" : temperatureValue(high));
+    setText("todayLow", low == null ? "—" : temperatureValue(low));
+
+    const uv = findCurrentUV(weather, state.weatherData?.hourly);
+    setText("uvIndex", uv === null ? "—" : numberText(uv, 1));
+
+    setText(
+        "sunrise",
+        daily?.sunrise?.[0]
+            ? formatTime(daily.sunrise[0], state.location.timezone)
+            : "—"
+    );
+
+    setText(
+        "sunset",
+        daily?.sunset?.[0]
+            ? formatTime(daily.sunset[0], state.location.timezone)
+            : "—"
+    );
+
+    setText(
+        "currentLocalTime",
+        weather.time
+            ? `Local time: ${formatTime(weather.time, state.location.timezone)}`
+            : "Local weather conditions"
+    );
+
+    setText(
+        "updatedAt",
+        state.weatherData?.updated_at
+            ? `Updated ${formatDateTime(state.weatherData.updated_at)} · ${state.weatherData.source || "Weather provider"}`
+            : "Weather data loaded"
+    );
+
+    updateTemperatureUnitLabels();
 }
 
-/* -------------------- Hourly forecast -------------------- */
+function updateTemperatureUnitLabels() {
+    document.querySelectorAll(".degree").forEach((element) => {
+        element.textContent = state.useFahrenheit ? "°F" : "°C";
+    });
 
-function renderHourlyForecast(result) {
-    const hourly = result.hourly || {};
-    const times = asArray(hourly.time);
-    const temperatures = asArray(hourly.temperature_2m);
-    const codes = asArray(hourly.weather_code || hourly.weathercode);
-    const rain = asArray(hourly.precipitation_probability);
+    const button = $("unitToggle");
+    if (button) {
+        button.textContent = state.useFahrenheit
+            ? "Switch to °C"
+            : "Switch to °F";
+    }
+}
 
-    if (!times.length) {
-        el.hourlyForecast.innerHTML = '<p class="muted">Hourly forecast is unavailable.</p>';
+/* =========================================================
+   HOURLY FORECAST
+   ========================================================= */
+
+function renderHourly(hourly) {
+    const container = $("hourlyForecast");
+    if (!container) return;
+
+    const times = hourly?.time || [];
+    const temperatures = hourly?.temperature_2m || [];
+    const codes = hourly?.weather_code || [];
+    const rainProbabilities = hourly?.precipitation_probability || [];
+
+    if (!times.length || !temperatures.length) {
+        container.innerHTML =
+            '<div class="placeholder-card">Hourly forecast is unavailable for this location.</div>';
         return;
     }
 
-    const now = Date.now();
-    let indices = times.map((time, index) => ({
-        time,
-        index,
-        stamp: new Date(time).getTime()
-    })).filter(item => Number.isFinite(item.stamp) && item.stamp >= now - 3600000).slice(0, 24);
+    const currentTime = state.weatherData?.current?.time;
+    let startIndex = 0;
 
-    if (!indices.length) {
-        indices = times.slice(0, 24).map((time, index) => ({ time, index }));
+    if (currentTime) {
+        const currentStamp = new Date(currentTime).getTime();
+
+        if (Number.isFinite(currentStamp)) {
+            const index = times.findIndex((time) => {
+                const stamp = new Date(time).getTime();
+                return Number.isFinite(stamp) && stamp >= currentStamp;
+            });
+
+            if (index >= 0) startIndex = index;
+        }
     }
 
-    el.hourlyForecast.innerHTML = indices.map(({ time, index }, position) => {
-        const [description, icon] = weatherInfo(codes[index]);
-        return `
-            <div class="hour-card">
-                <span class="hour-time">${position === 0 ? "Now" : escapeHTML(timeLabel(time))}</span>
-                <span class="hour-icon" title="${escapeHTML(description)}">${icon}</span>
-                <strong>${temperature(temperatures[index])}</strong>
-                <small>${rain[index] == null ? "Rain —" : `${fmt(rain[index])}% rain`}</small>
-            </div>`;
-    }).join("");
+    const fragment = document.createDocumentFragment();
+
+    times.slice(startIndex, startIndex + 24).forEach((time, offset) => {
+        const index = startIndex + offset;
+        const [description, icon] = weatherCodeInfo(codes[index]);
+
+        const card = document.createElement("article");
+        card.className = "hourly-card";
+
+        const timeText = document.createElement("p");
+        timeText.className = "forecast-time";
+        timeText.textContent = offset === 0
+            ? "Now"
+            : formatTime(time, state.location.timezone);
+
+        const weatherIcon = document.createElement("div");
+        weatherIcon.className = "forecast-icon";
+        weatherIcon.textContent = icon;
+        weatherIcon.setAttribute("title", description);
+
+        const temperature = document.createElement("strong");
+        temperature.className = "forecast-temperature";
+        temperature.textContent = temperatureValue(temperatures[index]);
+
+        const rain = document.createElement("p");
+        rain.className = "forecast-rain";
+        const chance = rainProbabilities[index];
+        rain.textContent = chance == null
+            ? "Rain —"
+            : `Rain ${numberText(chance)}%`;
+
+        card.append(timeText, weatherIcon, temperature, rain);
+        fragment.appendChild(card);
+    });
+
+    container.replaceChildren(fragment);
 }
 
-/* -------------------- Daily forecast -------------------- */
+/* =========================================================
+   SEVEN-DAY FORECAST
+   ========================================================= */
 
-function renderDailyForecast(result) {
-    const daily = result.daily || {};
-    const times = asArray(daily.time);
-    const highs = asArray(daily.temperature_2m_max);
-    const lows = asArray(daily.temperature_2m_min);
-    const codes = asArray(daily.weather_code || daily.weathercode);
-    const rain = asArray(daily.precipitation_probability_max);
-    const sunrise = asArray(daily.sunrise);
-    const sunset = asArray(daily.sunset);
+function renderDaily(daily) {
+    const container = $("dailyForecast");
+    if (!container) return;
+
+    const times = daily?.time || [];
+    const codes = daily?.weather_code || [];
+    const highs = daily?.temperature_2m_max || [];
+    const lows = daily?.temperature_2m_min || [];
+    const rain = daily?.precipitation_probability_max || [];
+    const uvValues = daily?.uv_index_max || [];
 
     if (!times.length) {
-        el.dailyForecast.innerHTML = '<p class="muted">Daily forecast is unavailable.</p>';
+        container.innerHTML =
+            '<div class="placeholder-card">The daily forecast is unavailable.</div>';
         return;
     }
 
-    el.dailyForecast.innerHTML = times.slice(0, 7).map((day, index) => {
-        const [description, icon] = weatherInfo(codes[index]);
+    const fragment = document.createDocumentFragment();
 
-        return `
-            <div class="day-row">
-                <div class="day-name">
-                    <strong>${index === 0 ? "Today" : escapeHTML(dayLabel(day))}</strong>
-                    <small>${escapeHTML(description)}</small>
-                </div>
-                <span class="day-icon">${icon}</span>
-                <div class="day-rain">${rain[index] == null ? "—" : `💧 ${fmt(rain[index])}%`}</div>
-                <div class="day-temperatures">
-                    <strong>${temperature(highs[index])}</strong>
-                    <span>${temperature(lows[index])}</span>
-                </div>
-                <div class="day-sun">
-                    ${sunrise[index] ? `<small>↑ ${escapeHTML(timeLabel(sunrise[index]))}</small>` : ""}
-                    ${sunset[index] ? `<small>↓ ${escapeHTML(timeLabel(sunset[index]))}</small>` : ""}
-                </div>
-            </div>`;
-    }).join("");
+    times.forEach((date, index) => {
+        const [description, icon] = weatherCodeInfo(codes[index]);
+
+        const row = document.createElement("article");
+        row.className = "daily-row";
+
+        const day = document.createElement("span");
+        day.className = "daily-day";
+        day.textContent = index === 0
+            ? "Today"
+            : formatForecastDay(date, state.location.timezone);
+
+        const weatherIcon = document.createElement("span");
+        weatherIcon.className = "daily-icon";
+        weatherIcon.textContent = icon;
+        weatherIcon.title = description;
+
+        const condition = document.createElement("span");
+        condition.className = "daily-description";
+        condition.textContent = description;
+
+        const temperature = document.createElement("span");
+        temperature.className = "daily-temperature";
+        temperature.textContent =
+            `${temperatureValue(lows[index])} / ${temperatureValue(highs[index])}`;
+
+        const details = document.createElement("span");
+        details.className = "daily-details";
+
+        const rainText = rain[index] == null
+            ? "Rain —"
+            : `Rain ${numberText(rain[index])}%`;
+
+        const uvText = uvValues[index] == null
+            ? "UV —"
+            : `UV ${numberText(uvValues[index], 1)}`;
+
+        details.textContent = `${rainText} · ${uvText}`;
+
+        row.append(day, weatherIcon, condition, temperature, details);
+        fragment.appendChild(row);
+    });
+
+    container.replaceChildren(fragment);
 }
 
-/* -------------------- Air quality -------------------- */
+/* =========================================================
+   AIR QUALITY
+   ========================================================= */
 
-function aqiCategory(value) {
-    const aqi = asNumber(value);
+function aqiCategory(value, type) {
+    const aqi = finiteNumber(value);
+    if (aqi === null) {
+        return {
+            title: "Air quality unavailable",
+            description: "Air-quality data is not currently available.",
+            className: "unavailable"
+        };
+    }
 
-    if (aqi === null) return {
-        label: "Unavailable",
-        className: "aqi-unknown",
-        advice: "Air-quality data is currently unavailable."
-    };
+    // European AQI has a different scale from US AQI.
+    if (type === "european") {
+        if (aqi <= 20) {
+            return {
+                title: "Good",
+                description: "Air pollution poses little or no immediate concern.",
+                className: "good"
+            };
+        }
+        if (aqi <= 40) {
+            return {
+                title: "Fair",
+                description: "Air quality is generally acceptable.",
+                className: "moderate"
+            };
+        }
+        if (aqi <= 60) {
+            return {
+                title: "Moderate",
+                description: "Sensitive people may wish to reduce prolonged outdoor exertion.",
+                className: "sensitive"
+            };
+        }
+        if (aqi <= 80) {
+            return {
+                title: "Poor",
+                description: "Consider reducing prolonged outdoor exertion.",
+                className: "unhealthy"
+            };
+        }
+        return {
+            title: "Very poor",
+            description: "Reduce outdoor exertion and follow local health guidance.",
+            className: "very-unhealthy"
+        };
+    }
 
-    if (aqi <= 50) return {
-        label: "Good",
-        className: "aqi-good-text",
-        advice: "Air quality is generally satisfactory."
-    };
-
-    if (aqi <= 100) return {
-        label: "Moderate",
-        className: "aqi-moderate-text",
-        advice: "Unusually sensitive people may wish to limit prolonged outdoor exertion."
-    };
-
-    if (aqi <= 150) return {
-        label: "Unhealthy for sensitive groups",
-        className: "aqi-sensitive-text",
-        advice: "Sensitive groups should consider reducing prolonged outdoor exertion."
-    };
-
-    if (aqi <= 200) return {
-        label: "Unhealthy",
-        className: "aqi-unhealthy-text",
-        advice: "Consider reducing prolonged outdoor activity."
-    };
-
-    if (aqi <= 300) return {
-        label: "Very unhealthy",
-        className: "aqi-severe-text",
-        advice: "Reduce outdoor exertion and follow local health guidance."
-    };
+    if (aqi <= 50) {
+        return {
+            title: "Good",
+            description: "Air quality is satisfactory.",
+            className: "good"
+        };
+    }
+    if (aqi <= 100) {
+        return {
+            title: "Moderate",
+            description: "Unusually sensitive people may be affected.",
+            className: "moderate"
+        };
+    }
+    if (aqi <= 150) {
+        return {
+            title: "Unhealthy for sensitive groups",
+            description: "Sensitive groups should limit prolonged outdoor exertion.",
+            className: "sensitive"
+        };
+    }
+    if (aqi <= 200) {
+        return {
+            title: "Unhealthy",
+            description: "Some people may experience health effects.",
+            className: "unhealthy"
+        };
+    }
+    if (aqi <= 300) {
+        return {
+            title: "Very unhealthy",
+            description: "Health alert: reduce outdoor exposure.",
+            className: "very-unhealthy"
+        };
+    }
 
     return {
-        label: "Hazardous",
-        className: "aqi-severe-text",
-        advice: "Avoid prolonged outdoor exertion and follow official health advice."
+        title: "Hazardous",
+        description: "Avoid outdoor exertion and follow official local guidance.",
+        className: "very-unhealthy"
     };
 }
 
 function renderAirQuality(air) {
-    const data = air && typeof air === "object" ? air : {};
-    const current = data.current || {};
-    const aqi = valueFrom(current, "us_aqi");
-    const euAqi = valueFrom(current, "european_aqi");
-    const category = aqiCategory(aqi);
+    if (!air) {
+        setText("aqiNumber", "—");
+        setText("aqiTitle", "Air quality unavailable");
+        setText("aqiDescription", "The air-quality provider did not return readings.");
 
-    el.airQualityStatus.textContent = category.label;
-    el.airQualityStatus.className = `status-pill ${category.className}`;
+        const badge = $("aqiBadge");
+        if (badge) {
+            badge.textContent = "Unavailable";
+            badge.className = "aqi-badge unavailable";
+        }
 
-    el.airSummary.innerHTML = `
-        <div class="air-score ${category.className}">
-            <strong>${aqi == null ? "—" : fmt(aqi)}</strong>
-            <span>US AQI</span>
-        </div>
-        <div class="air-summary-copy">
-            <h3>${escapeHTML(category.label)}</h3>
-            <p>${escapeHTML(category.advice)}</p>
-            <small>European AQI: ${euAqi == null ? "—" : fmt(euAqi)}</small>
-        </div>`;
+        [
+            "pm25", "pm10", "co", "no2", "so2", "o3"
+        ].forEach((id) => setText(id, "—"));
 
-    const pollutants = {
-        pm25Value: current.pm2_5,
-        pm10Value: current.pm10,
-        coValue: current.carbon_monoxide,
-        no2Value: current.nitrogen_dioxide,
-        so2Value: current.sulphur_dioxide,
-        o3Value: current.ozone
-    };
-
-    Object.entries(pollutants).forEach(([id, value]) => {
-        const node = document.getElementById(id);
-        if (node) node.textContent = value == null ? "—" : fmt(value, 1);
-    });
-
-    const time = current.time;
-    el.airDetail.textContent = time
-        ? `Latest available measurement: ${time}. Pollutant readings and AQI may vary by location and provider.`
-        : "Air quality data may be unavailable for some locations. Follow official local health guidance.";
-}
-
-/* -------------------- Map -------------------- */
-
-function initializeMap() {
-    if (!window.L || !$("#weatherMap") || state.mapReady) return;
-
-    state.map = L.map("weatherMap", {
-        zoomControl: true,
-        scrollWheelZoom: false
-    }).setView([20, 0], 2);
-
-    L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
-        attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a>',
-        maxZoom: 19
-    }).addTo(state.map);
-
-    state.map.on("click", event => {
-        el.latitudeInput.value = event.latlng.lat.toFixed(5);
-        el.longitudeInput.value = event.latlng.lng.toFixed(5);
-        el.coordinateForm.classList.remove("hidden");
-        showToast("Coordinates selected. Click Find weather to load this point.");
-    });
-
-    state.mapReady = true;
-}
-
-function updateMap(location) {
-    if (!state.mapReady || !state.map || !location) return;
-
-    const lat = Number(location.latitude);
-    const lon = Number(location.longitude);
-
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-
-    const position = [lat, lon];
-    state.map.flyTo(position, 7, { duration: 0.6 });
-
-    if (state.marker) {
-        state.marker.setLatLng(position);
-    } else {
-        state.marker = L.marker(position).addTo(state.map);
-    }
-
-    state.marker.bindPopup(escapeHTML(locationLabel(location))).openPopup();
-    el.coordinatesDisplay.textContent = `${lat.toFixed(4)}, ${lon.toFixed(4)}`;
-}
-
-/* -------------------- Favorites -------------------- */
-
-function sameLocation(a, b) {
-    if (!a || !b) return false;
-
-    const first = normalizeLocation(a);
-    const second = normalizeLocation(b);
-
-    if (first.id !== null && second.id !== null && String(first.id) === String(second.id)) {
-        return true;
-    }
-
-    return first.name.toLowerCase() === second.name.toLowerCase()
-        && first.latitude !== null
-        && second.latitude !== null
-        && Math.abs(first.latitude - second.latitude) < 0.001
-        && Math.abs(first.longitude - second.longitude) < 0.001;
-}
-
-function updateFavoriteButton() {
-    if (!state.location) {
-        el.favoriteButton.textContent = "☆";
-        el.favoriteButton.classList.remove("is-favorite");
         return;
     }
 
-    const saved = state.favorites.some(item => sameLocation(item, state.location));
-    el.favoriteButton.textContent = saved ? "★" : "☆";
-    el.favoriteButton.classList.toggle("is-favorite", saved);
-    el.favoriteButton.title = saved ? "Remove from favorites" : "Save this location";
+    // Prefer US AQI where available. Otherwise label the European scale correctly.
+    const usAqi = finiteNumber(air.us_aqi);
+    const europeanAqi = finiteNumber(air.european_aqi);
+    const usingEuropean = usAqi === null && europeanAqi !== null;
+    const selectedAqi = usAqi !== null ? usAqi : europeanAqi;
+
+    const category = aqiCategory(
+        selectedAqi,
+        usingEuropean ? "european" : "us"
+    );
+
+    setText("aqiNumber", selectedAqi === null ? "—" : numberText(selectedAqi));
+    setText("aqiTitle", category.title);
+    setText(
+        "aqiDescription",
+        selectedAqi === null
+            ? "No AQI value was returned by the provider."
+            : `${category.description}${usingEuropean ? " European AQI scale." : " US AQI scale."}`
+    );
+
+    const badge = $("aqiBadge");
+    if (badge) {
+        badge.textContent = selectedAqi === null
+            ? "Unavailable"
+            : category.title;
+        badge.className = `aqi-badge ${category.className}`;
+    }
+
+    const circle = document.querySelector(".aqi-circle");
+    if (circle) {
+        circle.classList.remove(
+            "good", "moderate", "sensitive", "unhealthy",
+            "very-unhealthy", "unavailable"
+        );
+        circle.classList.add(category.className);
+    }
+
+    const pollutants = [
+        ["pm25", air.pm2_5],
+        ["pm10", air.pm10],
+        ["co", air.carbon_monoxide],
+        ["no2", air.nitrogen_dioxide],
+        ["so2", air.sulphur_dioxide],
+        ["o3", air.ozone]
+    ];
+
+    pollutants.forEach(([id, value]) => {
+        setText(id, value == null ? "—" : numberText(value, 2));
+    });
+}
+
+/* =========================================================
+   RENDER ALL WEATHER DATA
+   ========================================================= */
+
+function renderWeather(data) {
+    if (!data || !data.current || !data.location) {
+        showError("The weather service returned incomplete weather data.");
+        return;
+    }
+
+    state.weatherData = data;
+    state.location = {
+        ...state.location,
+        ...data.location
+    };
+
+    renderCurrent(data.current, data.daily || {});
+    renderHourly(data.hourly || {});
+    renderDaily(data.daily || {});
+    renderAirQuality(data.air_quality);
+
+    updateFavoriteButton();
+    updateMapLocation();
+
+    document.title = `${state.location.name || "Weather"} | WeatherWorld`;
+}
+
+/* =========================================================
+   LOAD WEATHER
+   ========================================================= */
+
+async function loadWeather(location, options = {}) {
+    if (!location) return;
+
+    const latitude = finiteNumber(location.latitude);
+    const longitude = finiteNumber(location.longitude);
+
+    if (
+        latitude === null ||
+        longitude === null ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
+    ) {
+        showError("Please select valid latitude and longitude coordinates.");
+        return;
+    }
+
+    const requestId = ++state.weatherRequestId;
+
+    if (state.weatherAbortController) {
+        state.weatherAbortController.abort();
+    }
+
+    state.weatherAbortController = new AbortController();
+
+    state.location = {
+        name: location.name || "Selected location",
+        country: location.country || "",
+        admin1: location.admin1 || "",
+        latitude,
+        longitude,
+        timezone: location.timezone || "auto"
+    };
+
+    clearMessages();
+    setStatus(true, "Loading weather");
+
+    if (!options.silent) showLoading(true);
+
+    try {
+        const query = makeQuery(state.location);
+
+        const data = await apiFetch(
+            `${API.weather}?${query}`,
+            { signal: state.weatherAbortController.signal }
+        );
+
+        if (requestId !== state.weatherRequestId) return;
+
+        renderWeather(data);
+        setStatus(true, "Weather updated");
+
+        if (!options.silent) {
+            showSuccess(`Weather loaded for ${localLocationName(state.location)}.`);
+        }
+
+        await Promise.allSettled([
+            loadFavorites(),
+            loadHistory()
+        ]);
+    } catch (error) {
+        if (requestId !== state.weatherRequestId) return;
+        if (error.name === "AbortError") return;
+
+        setStatus(false, "Weather unavailable");
+        showError(error.message || "Unable to load weather.");
+        console.error("Weather loading error:", error);
+    } finally {
+        if (requestId === state.weatherRequestId) {
+            showLoading(false);
+        }
+    }
+}
+
+/* =========================================================
+   CITY SEARCH AND AUTOCOMPLETE
+   ========================================================= */
+
+function hideSearchResults() {
+    hideElement($("searchResults"));
+}
+
+function renderSearchResults(results) {
+    const container = $("searchResults");
+    if (!container) return;
+
+    state.lastSearchResults = Array.isArray(results) ? results : [];
+    container.replaceChildren();
+
+    if (!state.lastSearchResults.length) {
+        const empty = document.createElement("div");
+        empty.className = "search-empty";
+        empty.textContent = "No locations found. Try adding a country name.";
+        container.appendChild(empty);
+        showElement(container);
+        return;
+    }
+
+    state.lastSearchResults.forEach((location, index) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "search-result";
+        button.setAttribute("role", "option");
+        button.dataset.searchIndex = String(index);
+
+        const title = document.createElement("strong");
+        title.textContent = location.name || "Unknown location";
+
+        const subtitle = document.createElement("span");
+        subtitle.textContent = [
+            location.admin1,
+            location.country
+        ].filter(Boolean).join(", ");
+
+        button.append(title, subtitle);
+        container.appendChild(button);
+    });
+
+    showElement(container);
+}
+
+async function searchLocations(query) {
+    const trimmed = query.trim();
+    const requestId = ++state.searchRequestId;
+
+    if (trimmed.length < 2) {
+        hideSearchResults();
+        return [];
+    }
+
+    if (state.searchAbortController) {
+        state.searchAbortController.abort();
+    }
+
+    state.searchAbortController = new AbortController();
+
+    try {
+        const params = new URLSearchParams({ q: trimmed });
+        const data = await apiFetch(
+            `${API.search}?${params}`,
+            { signal: state.searchAbortController.signal }
+        );
+
+        if (requestId !== state.searchRequestId) return [];
+
+        renderSearchResults(data.results || []);
+        return data.results || [];
+    } catch (error) {
+        if (error.name !== "AbortError") {
+            console.error("Location search error:", error);
+        }
+        return [];
+    }
+}
+
+async function submitSearch(query) {
+    const trimmed = query.trim();
+
+    if (!trimmed) {
+        showError("Enter a city, town, village, or country.");
+        return;
+    }
+
+    const results = await searchLocations(trimmed);
+
+    if (!results.length) {
+        showError("No matching locations found. Try including the country.");
+        return;
+    }
+
+    // If the search has one result, select it immediately.
+    if (results.length === 1) {
+        hideSearchResults();
+        await loadWeather(results[0]);
+        return;
+    }
+
+    // For multiple matches, let the user choose the intended location.
+    showSuccess("Select the correct location from the suggestions.");
+}
+
+function selectSearchResult(index) {
+    const location = state.lastSearchResults[index];
+    if (!location) return;
+
+    hideSearchResults();
+
+    if ($("locationInput")) {
+        $("locationInput").value = localLocationName(location);
+    }
+
+    loadWeather(location);
+}
+
+/* =========================================================
+   FAVORITES
+   ========================================================= */
+
+function updateFavoriteButton() {
+    const button = $("favoriteToggle");
+    if (!button) return;
+
+    const saved = state.favorites.some((item) =>
+        sameCoordinates(item, state.location)
+    );
+
+    button.textContent = saved ? "★" : "＋";
+    button.title = saved ? "Location saved" : "Save current location";
+    button.setAttribute(
+        "aria-label",
+        saved ? "Current location is saved" : "Save current location"
+    );
+}
+
+function renderFavorites() {
+    const container = $("favoritesList");
+    if (!container) return;
+
+    container.replaceChildren();
+
+    if (!state.favorites.length) {
+        const empty = document.createElement("p");
+        empty.className = "muted small-text";
+        empty.textContent = "Your saved locations will appear here.";
+        container.appendChild(empty);
+        updateFavoriteButton();
+        return;
+    }
+
+    state.favorites.forEach((favorite) => {
+        const row = document.createElement("div");
+        row.className = "sidebar-item";
+
+        const select = document.createElement("button");
+        select.type = "button";
+        select.className = "sidebar-item-button";
+        select.dataset.favoriteId = String(favorite.id);
+        select.textContent = localLocationName(favorite);
+
+        const remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "icon-button small";
+        remove.dataset.removeFavorite = String(favorite.id);
+        remove.textContent = "×";
+        remove.title = "Remove favorite";
+        remove.setAttribute("aria-label", `Remove ${favorite.name}`);
+
+        row.append(select, remove);
+        container.appendChild(row);
+    });
+
+    updateFavoriteButton();
 }
 
 async function loadFavorites() {
     try {
-        const data = await apiRequest(API.favorites);
-        state.favorites = responseItems(data, "favorites", "items", "data");
+        const data = await apiFetch(API.favorites);
+        state.favorites = Array.isArray(data.results) ? data.results : [];
         renderFavorites();
-        updateFavoriteButton();
     } catch (error) {
-        el.favoritesList.innerHTML = '<p class="muted">Could not load favorites. Check the server.</p>';
+        console.error("Could not load favorites:", error);
     }
-}
-
-function renderFavorites() {
-    if (!state.favorites.length) {
-        el.favoritesList.innerHTML = '<p class="muted">No saved locations yet. Click ☆ to save a place.</p>';
-        return;
-    }
-
-    el.favoritesList.innerHTML = state.favorites.map((item, index) => {
-        const location = normalizeLocation(item);
-
-        return `
-            <div class="saved-row">
-                <button type="button" class="saved-location" data-favorite-index="${index}">
-                    <span class="saved-location-icon">📍</span>
-                    <span>
-                        <strong>${escapeHTML(location.name)}</strong>
-                        <small>${escapeHTML([location.admin1, location.country].filter(Boolean).join(", "))}</small>
-                    </span>
-                </button>
-                <button type="button" class="remove-saved" data-remove-favorite="${index}" aria-label="Remove favorite">×</button>
-            </div>`;
-    }).join("");
 }
 
 async function toggleFavorite() {
-    if (!state.location) {
-        showToast("Search for a location first.", "error");
-        return;
-    }
-
-    const existing = state.favorites.find(item => sameLocation(item, state.location));
+    const existing = state.favorites.find((item) =>
+        sameCoordinates(item, state.location)
+    );
 
     try {
         if (existing) {
-            await apiRequest(API.favorites, {
-                method: "DELETE",
-                body: JSON.stringify({
-                    id: existing.id,
-                    name: existing.name,
-                    latitude: existing.latitude ?? existing.lat,
-                    longitude: existing.longitude ?? existing.lon
-                })
-            });
-            showToast("Favorite removed.");
+            await apiFetch(
+                `${API.favorites}/${encodeURIComponent(existing.id)}`,
+                { method: "DELETE" }
+            );
+            showSuccess("Location removed from favorites.");
         } else {
-            await apiRequest(API.favorites, {
+            await apiFetch(API.favorites, {
                 method: "POST",
-                body: JSON.stringify({
-                    name: state.location.name,
-                    country: state.location.country,
-                    country_code: state.location.country_code,
-                    admin1: state.location.admin1,
-                    latitude: state.location.latitude,
-                    longitude: state.location.longitude
-                })
+                body: JSON.stringify(state.location)
             });
-            showToast("Location saved to favorites.", "success");
+            showSuccess("Location added to favorites.");
         }
 
         await loadFavorites();
     } catch (error) {
-        showToast(error.message || "Could not update favorite.", "error");
+        showError(error.message || "Could not update favorites.");
     }
 }
 
-/* -------------------- History -------------------- */
+async function removeFavorite(id) {
+    try {
+        await apiFetch(
+            `${API.favorites}/${encodeURIComponent(id)}`,
+            { method: "DELETE" }
+        );
+
+        await loadFavorites();
+        showSuccess("Favorite removed.");
+    } catch (error) {
+        showError(error.message || "Could not remove favorite.");
+    }
+}
+
+/* =========================================================
+   RECENT SEARCH HISTORY
+   ========================================================= */
+
+function renderHistory() {
+    const container = $("historyList");
+    if (!container) return;
+
+    container.replaceChildren();
+
+    if (!state.history.length) {
+        const empty = document.createElement("p");
+        empty.className = "muted small-text";
+        empty.textContent = "Your recent searches will appear here.";
+        container.appendChild(empty);
+        return;
+    }
+
+    state.history.forEach((item) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.className = "history-item";
+        button.dataset.historyId = String(item.id);
+
+        const name = document.createElement("span");
+        name.textContent = localLocationName(item);
+
+        const time = document.createElement("small");
+        time.textContent = formatDateTime(item.searched_at);
+
+        button.append(name, time);
+        container.appendChild(button);
+    });
+}
 
 async function loadHistory() {
     try {
-        const data = await apiRequest(API.history);
-        state.history = responseItems(data, "history", "items", "data");
+        const data = await apiFetch(API.history);
+        state.history = Array.isArray(data.results) ? data.results : [];
         renderHistory();
     } catch (error) {
-        el.historyList.innerHTML = '<p class="muted">Could not load search history.</p>';
+        console.error("Could not load search history:", error);
     }
 }
 
-function renderHistory() {
-    if (!state.history.length) {
-        el.historyList.innerHTML = '<p class="muted">No recent searches yet.</p>';
-        return;
-    }
-
-    el.historyList.innerHTML = state.history.slice(0, 10).map((item, index) => {
-        const location = normalizeLocation(item);
-        return `
-            <button type="button" class="history-row" data-history-index="${index}">
-                <span class="history-clock">◷</span>
-                <span>
-                    <strong>${escapeHTML(location.name)}</strong>
-                    <small>${escapeHTML([location.admin1, location.country].filter(Boolean).join(", "))}</small>
-                </span>
-                <span class="saved-arrow">↗</span>
-            </button>`;
-    }).join("");
-}
-
-/* -------------------- Preferences -------------------- */
-
-function applyTheme(dark) {
-    state.dark = Boolean(dark);
-    document.body.classList.toggle("dark-theme", state.dark);
-    el.themeToggle.textContent = state.dark ? "☀" : "☾";
-    el.themeToggle.setAttribute(
-        "aria-label",
-        state.dark ? "Switch to light theme" : "Switch to dark theme"
-    );
-
-    try {
-        localStorage.setItem("weatherworld-theme", state.dark ? "dark" : "light");
-    } catch (_) {}
-}
+/* =========================================================
+   TEMPERATURE UNITS AND THEME
+   ========================================================= */
 
 function toggleUnits() {
-    state.unit = isFahrenheit() ? "celsius" : "fahrenheit";
-    el.unitToggle.textContent = isFahrenheit() ? "°F / °C" : "°C / °F";
+    state.useFahrenheit = !state.useFahrenheit;
 
-    if (state.weather) {
-        renderCurrentWeather(state.weather);
-        renderHourlyForecast(state.weather);
-        renderDailyForecast(state.weather);
+    updateTemperatureUnitLabels();
+
+    if (state.weatherData) {
+        renderCurrent(
+            state.weatherData.current,
+            state.weatherData.daily || {}
+        );
+        renderHourly(state.weatherData.hourly || {});
+        renderDaily(state.weatherData.daily || {});
     }
 }
 
-function restorePreferences() {
-    try {
-        applyTheme(localStorage.getItem("weatherworld-theme") === "dark");
-    } catch (_) {
-        applyTheme(false);
+function applyTheme() {
+    document.body.classList.toggle("dark-mode", state.darkMode);
+    document.documentElement.dataset.theme = state.darkMode ? "dark" : "light";
+
+    const button = $("themeToggle");
+    if (button) {
+        button.textContent = state.darkMode ? "☀" : "☾";
+        button.setAttribute(
+            "aria-label",
+            state.darkMode ? "Switch to light mode" : "Switch to dark mode"
+        );
+        button.title = state.darkMode ? "Switch to light mode" : "Switch to dark mode";
     }
 
-    state.unit = "celsius";
+    if (state.map) {
+        window.setTimeout(() => state.map.invalidateSize(), 100);
+    }
 }
 
-/* -------------------- Device location -------------------- */
+function toggleTheme() {
+    state.darkMode = !state.darkMode;
+    applyTheme();
+}
 
-function useCurrentLocation() {
+/* =========================================================
+   GEOLOCATION AND COORDINATE SEARCH
+   ========================================================= */
+
+function useBrowserLocation() {
     if (!navigator.geolocation) {
-        showToast("Your browser does not support location access.", "error");
+        showError("Geolocation is not supported by this browser.");
         return;
     }
 
-    setLoading(true);
+    clearMessages();
+    showLoading(true);
 
     navigator.geolocation.getCurrentPosition(
-        async position => {
-            const { latitude, longitude } = position.coords;
-            el.latitudeInput.value = latitude;
-            el.longitudeInput.value = longitude;
-            el.coordinateForm.classList.remove("hidden");
+        async (position) => {
+            showLoading(false);
 
-            try {
-                await searchByCoordinates(latitude, longitude);
-            } finally {
-                setLoading(false);
-            }
+            await loadWeather({
+                name: "My location",
+                country: "",
+                latitude: position.coords.latitude,
+                longitude: position.coords.longitude,
+                timezone: "auto"
+            });
         },
-        error => {
-            setLoading(false);
+        (error) => {
+            showLoading(false);
+
             const messages = {
-                1: "Location permission was denied. Search by city instead.",
+                1: "Location access was denied. Allow it in your browser settings.",
                 2: "Your current location could not be determined.",
                 3: "Location request timed out. Please try again."
             };
-            showToast(messages[error.code] || "Could not access your location.", "error");
+
+            showError(messages[error.code] || "Could not access your location.");
         },
-        { enableHighAccuracy: false, timeout: 10000, maximumAge: 300000 }
+        {
+            enableHighAccuracy: false,
+            timeout: 12000,
+            maximumAge: 300000
+        }
     );
 }
 
-/* -------------------- Health and CSV export -------------------- */
+function searchCoordinates() {
+    const raw = window.prompt(
+        "Enter latitude and longitude separated by a comma.\nExample: 14.46795, 78.82346"
+    );
 
-async function checkHealth() {
-    try {
-        await apiRequest(API.health);
-        el.apiStatusDot.classList.add("online");
-        el.apiStatusDot.classList.remove("offline");
-        el.apiStatusText.textContent = "Connected";
-    } catch (_) {
-        el.apiStatusDot.classList.remove("online");
-        el.apiStatusDot.classList.add("offline");
-        el.apiStatusText.textContent = "Unavailable";
+    if (raw === null) return;
+
+    const parts = raw.split(",").map((part) => part.trim());
+
+    if (parts.length !== 2) {
+        showError("Enter coordinates as latitude, longitude.");
+        return;
     }
+
+    const latitude = finiteNumber(parts[0]);
+    const longitude = finiteNumber(parts[1]);
+
+    if (
+        latitude === null ||
+        longitude === null ||
+        latitude < -90 ||
+        latitude > 90 ||
+        longitude < -180 ||
+        longitude > 180
+    ) {
+        showError("Coordinates are invalid. Latitude must be −90 to 90 and longitude −180 to 180.");
+        return;
+    }
+
+    loadWeather({
+        name: "Selected coordinates",
+        country: "",
+        latitude,
+        longitude,
+        timezone: "auto"
+    });
 }
 
-async function exportHistory() {
+/* =========================================================
+   LEAFLET WEATHER MAP
+   ========================================================= */
+
+function initializeMap() {
+    const container = $("weatherMap");
+
+    if (!container) return;
+
+    if (typeof L === "undefined") {
+        container.textContent =
+            "The map library could not load. Check your internet connection.";
+        return;
+    }
+
     try {
-        const response = await fetch(API.export);
+        state.map = L.map(container).setView(
+            [state.location.latitude, state.location.longitude],
+            7
+        );
 
-        if (!response.ok) {
-            let message = "Could not export history.";
-            try {
-                const data = await response.json();
-                message = data.error || message;
-            } catch (_) {}
-            throw new Error(message);
-        }
+        L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png", {
+            attribution: '&copy; <a href="https://www.openstreetmap.org/copyright">OpenStreetMap</a> contributors',
+            maxZoom: 19
+        }).addTo(state.map);
 
-        const blob = await response.blob();
-        const objectURL = URL.createObjectURL(blob);
-        const link = document.createElement("a");
-        link.href = objectURL;
-        link.download = "weather-history.csv";
-        document.body.appendChild(link);
-        link.click();
-        link.remove();
-        URL.revokeObjectURL(objectURL);
-        showToast("CSV export downloaded.", "success");
+        state.mapMarker = L.marker([
+            state.location.latitude,
+            state.location.longitude
+        ]).addTo(state.map);
+
+        state.mapMarker.bindPopup(
+            localLocationName(state.location)
+        );
+
+        state.map.on("click", (event) => {
+            const latitude = Number(event.latlng.lat.toFixed(5));
+            const longitude = Number(event.latlng.lng.toFixed(5));
+
+            loadWeather({
+                name: "Map selection",
+                country: "",
+                latitude,
+                longitude,
+                timezone: "auto"
+            });
+        });
+
+        window.setTimeout(() => {
+            state.map?.invalidateSize();
+        }, 300);
     } catch (error) {
-        showToast(error.message || "Export failed.", "error");
+        console.error("Map initialization error:", error);
+        container.textContent = "Could not initialize the map.";
     }
 }
 
-/* -------------------- Event handlers -------------------- */
+function updateMapLocation() {
+    if (!state.map || !state.mapMarker) return;
 
-function bindEvents() {
-    el.searchForm.addEventListener("submit", event => {
+    const position = [
+        Number(state.location.latitude),
+        Number(state.location.longitude)
+    ];
+
+    state.mapMarker.setLatLng(position);
+    state.mapMarker.setPopupContent(localLocationName(state.location));
+
+    state.map.setView(position, Math.max(state.map.getZoom(), 7));
+
+    window.setTimeout(() => state.map?.invalidateSize(), 100);
+}
+
+/* =========================================================
+   SERVICE HEALTH
+   ========================================================= */
+
+async function checkProviderHealth() {
+    try {
+        const result = await apiFetch(API.providerHealth);
+        const online = result.status === "online";
+
+        setProviderStatus(
+            online,
+            online ? "Weather service online" : "Weather service offline"
+        );
+    } catch (error) {
+        setProviderStatus(false, "Weather service unavailable");
+        console.error("Provider health check failed:", error);
+    }
+}
+
+/* =========================================================
+   EVENT LISTENERS
+   ========================================================= */
+
+function attachEvents() {
+    const searchForm = $("searchForm");
+    const input = $("locationInput");
+    const results = $("searchResults");
+
+    searchForm?.addEventListener("submit", async (event) => {
         event.preventDefault();
-        searchByText(el.locationInput.value);
+        hideSearchResults();
+        await submitSearch(input?.value || "");
     });
 
-    el.locationInput.addEventListener("input", autocomplete);
+    input?.addEventListener("input", () => {
+        window.clearTimeout(state.searchTimer);
 
-    el.locationInput.addEventListener("keydown", event => {
-        if (event.key === "Escape") hideSuggestions();
+        const query = input.value.trim();
 
-        if (event.key === "ArrowDown") {
-            const first = el.suggestions.querySelector(".suggestion-item");
-            if (first) {
-                event.preventDefault();
-                first.focus();
-            }
-        }
-    });
-
-    el.suggestions.addEventListener("click", async event => {
-        const button = event.target.closest("[data-suggestion-index]");
-        if (!button) return;
-
-        const location = state.suggestions[Number(button.dataset.suggestionIndex)];
-        if (!location) return;
-
-        try {
-            await loadWeather(location);
-        } catch (_) {}
-    });
-
-    document.addEventListener("click", event => {
-        if (!event.target.closest(".search-panel")) hideSuggestions();
-    });
-
-    el.coordinateToggle.addEventListener("click", () => {
-        el.coordinateForm.classList.toggle("hidden");
-        if (!el.coordinateForm.classList.contains("hidden")) {
-            el.latitudeInput.focus();
-        }
-    });
-
-    el.coordinateForm.addEventListener("submit", event => {
-        event.preventDefault();
-        searchByCoordinates(el.latitudeInput.value, el.longitudeInput.value);
-    });
-
-    el.currentLocationButton.addEventListener("click", useCurrentLocation);
-    el.unitToggle.addEventListener("click", toggleUnits);
-    el.themeToggle.addEventListener("click", () => applyTheme(!state.dark));
-    el.favoriteButton.addEventListener("click", toggleFavorite);
-    el.refreshHistoryButton.addEventListener("click", loadHistory);
-    el.exportButton.addEventListener("click", exportHistory);
-
-    el.favoritesList.addEventListener("click", async event => {
-        const removeButton = event.target.closest("[data-remove-favorite]");
-
-        if (removeButton) {
-            const item = state.favorites[Number(removeButton.dataset.removeFavorite)];
-            if (!item) return;
-
-            try {
-                await apiRequest(API.favorites, {
-                    method: "DELETE",
-                    body: JSON.stringify({
-                        id: item.id,
-                        latitude: item.latitude ?? item.lat,
-                        longitude: item.longitude ?? item.lon,
-                        name: item.name
-                    })
-                });
-                await loadFavorites();
-                showToast("Favorite removed.");
-            } catch (error) {
-                showToast(error.message || "Could not remove favorite.", "error");
-            }
+        if (query.length < 2) {
+            hideSearchResults();
             return;
         }
 
-        const button = event.target.closest("[data-favorite-index]");
+        state.searchTimer = window.setTimeout(() => {
+            searchLocations(query);
+        }, 300);
+    });
+
+    results?.addEventListener("click", (event) => {
+        const button = event.target.closest("[data-search-index]");
         if (!button) return;
 
-        const location = state.favorites[Number(button.dataset.favoriteIndex)];
-        if (location) {
-            try {
-                await loadWeather(location);
-            } catch (_) {}
+        selectSearchResult(Number(button.dataset.searchIndex));
+    });
+
+    input?.addEventListener("keydown", (event) => {
+        if (event.key === "Escape") hideSearchResults();
+
+        if (event.key === "ArrowDown") {
+            const first = results?.querySelector("button");
+            first?.focus();
         }
     });
 
-    el.historyList.addEventListener("click", async event => {
-        const button = event.target.closest("[data-history-index]");
+    document.addEventListener("click", (event) => {
+        if (
+            results &&
+            !results.contains(event.target) &&
+            !searchForm?.contains(event.target)
+        ) {
+            hideSearchResults();
+        }
+    });
+
+    $("useLocationButton")?.addEventListener("click", useBrowserLocation);
+    $("coordinateButton")?.addEventListener("click", searchCoordinates);
+    $("favoriteToggle")?.addEventListener("click", toggleFavorite);
+    $("unitToggle")?.addEventListener("click", toggleUnits);
+    $("themeToggle")?.addEventListener("click", toggleTheme);
+
+    $("favoritesList")?.addEventListener("click", async (event) => {
+        const removeButton = event.target.closest("[data-remove-favorite]");
+
+        if (removeButton) {
+            await removeFavorite(removeButton.dataset.removeFavorite);
+            return;
+        }
+
+        const selectButton = event.target.closest("[data-favorite-id]");
+        if (!selectButton) return;
+
+        const favorite = state.favorites.find(
+            (item) => Number(item.id) === Number(selectButton.dataset.favoriteId)
+        );
+
+        if (favorite) await loadWeather(favorite);
+    });
+
+    $("historyList")?.addEventListener("click", async (event) => {
+        const button = event.target.closest("[data-history-id]");
         if (!button) return;
 
-        const location = state.history[Number(button.dataset.historyIndex)];
-        if (!location) return;
+        const item = state.history.find(
+            (entry) => Number(entry.id) === Number(button.dataset.historyId)
+        );
 
-        try {
-            await loadWeather(location);
-        } catch (_) {}
+        if (item) await loadWeather(item);
+    });
+
+    $("refreshHistory")?.addEventListener("click", async () => {
+        await loadHistory();
+        showSuccess("Search history refreshed.");
+    });
+
+    document.querySelectorAll(".nav-link").forEach((link) => {
+        link.addEventListener("click", () => {
+            document.querySelectorAll(".nav-link").forEach((item) => {
+                item.classList.remove("active");
+            });
+
+            link.classList.add("active");
+
+            if (link.getAttribute("href") === "#mapSection") {
+                window.setTimeout(() => state.map?.invalidateSize(), 150);
+            }
+        });
     });
 }
 
-/* -------------------- Start dashboard -------------------- */
+/* =========================================================
+   STARTUP
+   ========================================================= */
 
-async function initializeDashboard() {
-    restorePreferences();
+async function initializeApp() {
+    attachEvents();
+    applyTheme();
+    updateTemperatureUnitLabels();
     initializeMap();
-    bindEvents();
 
-    await Promise.all([checkHealth(), loadFavorites(), loadHistory()]);
-
-    const params = new URLSearchParams(window.location.search);
-    const city = params.get("city");
-    const lat = params.get("latitude");
-    const lon = params.get("longitude");
-
-    if (lat !== null && lon !== null) {
-        await searchByCoordinates(lat, lon);
-    } else if (city) {
-        el.locationInput.value = city;
-        await searchByText(city);
+    try {
+        const health = await apiFetch(API.health);
+        if (health.status === "ok") {
+            setStatus(true, "Connected");
+        }
+    } catch (error) {
+        setStatus(false, "Backend unavailable");
+        showError("Could not connect to the WeatherWorld backend. Check that Flask is running.");
+        console.error("Backend health check failed:", error);
     }
+
+    await checkProviderHealth();
+
+    await Promise.allSettled([
+        loadFavorites(),
+        loadHistory()
+    ]);
+
+    await loadWeather(DEFAULT_LOCATION, { silent: true });
+
+    window.setTimeout(() => {
+        state.map?.invalidateSize();
+    }, 400);
 }
 
-document.addEventListener("DOMContentLoaded", initializeDashboard);
+if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", initializeApp, { once: true });
+} else {
+    initializeApp();
+}
