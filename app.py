@@ -5,6 +5,7 @@ import logging
 import math
 import os
 import sqlite3
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -28,6 +29,16 @@ REQUEST_TIMEOUT = 15
 GEOCODING_URL = "https://geocoding-api.open-meteo.com/v1/search"
 FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# In-memory API cache. Successful responses are reused to reduce API calls.
+API_CACHE = {}
+CACHE_MAX_ENTRIES = 200
+CACHE_TTLS = {
+    GEOCODING_URL: 3600,    # 1 hour
+    FORECAST_URL: 600,      # 10 minutes
+    AIR_QUALITY_URL: 1800,  # 30 minutes
+}
+STALE_CACHE_MAX_AGE = 21600  # Allow cached data up to 6 hours old on provider failure.
 
 DEFAULT_LOCATION = {
     "name": "Kadapa",
@@ -119,7 +130,6 @@ def initialize_database():
             CREATE INDEX IF NOT EXISTS idx_history_searched_at
             ON search_history(searched_at)
         """)
-
         db.commit()
 
 
@@ -160,26 +170,88 @@ def error_response(message, status_code=400):
     return jsonify({"error": message}), status_code
 
 
+# ============================================================
+# API REQUESTS WITH CACHING AND RATE-LIMIT HANDLING
+# ============================================================
+
 def api_get(url, params):
-    """Request JSON from an Open-Meteo endpoint."""
-    response = requests.get(
+    """
+    Fetch JSON from an API, cache successful results, and use cached
+    results when the provider is temporarily unavailable.
+
+    This avoids unnecessary repeat calls but cannot bypass a provider's
+    rate limits when no suitable cached response exists.
+    """
+    cache_key = (
         url,
-        params=params,
-        timeout=REQUEST_TIMEOUT,
-        headers={"User-Agent": "WeatherWorld/2.0"},
+        tuple(sorted((str(k), str(v)) for k, v in params.items()))
     )
-    response.raise_for_status()
+    now = time.time()
+    ttl = CACHE_TTLS.get(url, 300)
+    cached = API_CACHE.get(cache_key)
 
-    data = response.json()
-    if not isinstance(data, dict):
-        raise ValueError("Unexpected response from the weather provider.")
+    # Return a fresh cached response without making another API request.
+    if cached and now - cached["saved_at"] < ttl:
+        return cached["data"]
 
-    if data.get("error"):
-        raise ValueError(
-            clean_text(data.get("reason"), "Weather provider returned an error.")
+    try:
+        response = requests.get(
+            url,
+            params=params,
+            timeout=REQUEST_TIMEOUT,
+            headers={"User-Agent": "WeatherWorld/2.0"},
         )
 
-    return data
+        # Do not repeatedly retry a 429 response.
+        if response.status_code == 429:
+            if cached and now - cached["saved_at"] < STALE_CACHE_MAX_AGE:
+                app.logger.warning(
+                    "API rate limited; returning cached data for %s", url
+                )
+                return cached["data"]
+
+            response.raise_for_status()
+
+        response.raise_for_status()
+        data = response.json()
+
+        if not isinstance(data, dict):
+            raise ValueError("Unexpected response from the weather provider.")
+
+        if data.get("error"):
+            raise ValueError(
+                clean_text(
+                    data.get("reason"),
+                    "Weather provider returned an error."
+                )
+            )
+
+        # Save successful responses.
+        API_CACHE[cache_key] = {
+            "saved_at": now,
+            "data": data,
+        }
+
+        # Keep the in-memory cache bounded.
+        if len(API_CACHE) > CACHE_MAX_ENTRIES:
+            oldest_key = min(
+                API_CACHE,
+                key=lambda key: API_CACHE[key]["saved_at"]
+            )
+            API_CACHE.pop(oldest_key, None)
+
+        return data
+
+    except requests.RequestException:
+        # If the provider fails, use recent cached data if available.
+        if cached and now - cached["saved_at"] < STALE_CACHE_MAX_AGE:
+            app.logger.warning(
+                "API request failed; returning cached data for %s", url
+            )
+            return cached["data"]
+
+        app.logger.exception("API request failed for %s", url)
+        raise
 
 
 def location_from_args():
@@ -254,8 +326,6 @@ def get_forecast(latitude, longitude, timezone_name="auto"):
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
-
-        # Current conditions. UV index is explicitly requested.
         "current": ",".join([
             "temperature_2m",
             "relative_humidity_2m",
@@ -274,8 +344,6 @@ def get_forecast(latitude, longitude, timezone_name="auto"):
             "wind_gusts_10m",
             "uv_index",
         ]),
-
-        # Hourly forecast, including UV index.
         "hourly": ",".join([
             "temperature_2m",
             "relative_humidity_2m",
@@ -285,8 +353,6 @@ def get_forecast(latitude, longitude, timezone_name="auto"):
             "wind_speed_10m",
             "uv_index",
         ]),
-
-        # Seven-day forecast and daily maximum UV.
         "daily": ",".join([
             "weather_code",
             "temperature_2m_max",
@@ -299,7 +365,6 @@ def get_forecast(latitude, longitude, timezone_name="auto"):
             "wind_speed_10m_max",
         ]),
     }
-
     return api_get(FORECAST_URL, params)
 
 
@@ -319,7 +384,6 @@ def get_air_quality(latitude, longitude, timezone_name="auto"):
             "ozone",
         ]),
     }
-
     data = api_get(AIR_QUALITY_URL, params)
     return data.get("current")
 
@@ -396,7 +460,6 @@ def search_locations():
         })
 
         results = []
-
         for item in data.get("results", []):
             latitude = item.get("latitude")
             longitude = item.get("longitude")
@@ -417,13 +480,19 @@ def search_locations():
         return jsonify({"results": results})
 
     except requests.Timeout:
-        return error_response("Location search timed out. Please try again.", 504)
+        return error_response(
+            "Location search timed out. Please try again.", 504
+        )
     except requests.RequestException:
         app.logger.exception("City search request failed")
-        return error_response("Location search is temporarily unavailable.", 502)
+        return error_response(
+            "Location search is temporarily unavailable.", 502
+        )
     except ValueError:
         app.logger.exception("Invalid city search response")
-        return error_response("The location service returned invalid data.", 502)
+        return error_response(
+            "The location service returned invalid data.", 502
+        )
 
 
 # ============================================================
@@ -444,13 +513,20 @@ def weather():
             location["timezone"],
         )
     except requests.Timeout:
-        return error_response("The weather service timed out. Please retry.", 504)
+        return error_response(
+            "The weather service timed out. Please retry.", 504
+        )
     except requests.RequestException:
         app.logger.exception("Weather provider request failed")
-        return error_response("Could not retrieve weather data.", 502)
+        return error_response(
+            "Could not retrieve weather data. Please try again shortly.",
+            502,
+        )
     except ValueError:
         app.logger.exception("Invalid weather response")
-        return error_response("The weather service returned invalid data.", 502)
+        return error_response(
+            "The weather service returned invalid data.", 502
+        )
 
     current = data.get("current") or {}
     hourly = data.get("hourly") or {}
@@ -460,8 +536,7 @@ def weather():
     current["description"] = description
     current["icon"] = icon
 
-    # Fallback for providers/responses that do not include current UV.
-    # Find the hourly value closest to the current observation time.
+    # Fallback when current UV is not included in the response.
     if current.get("uv_index") is None:
         times = hourly.get("time") or []
         uv_values = hourly.get("uv_index") or []
@@ -502,7 +577,9 @@ def weather():
             location["timezone"],
         )
     except (requests.RequestException, ValueError):
-        air_quality_error = "Air-quality information is temporarily unavailable."
+        air_quality_error = (
+            "Air-quality information is temporarily unavailable."
+        )
         app.logger.warning("Air-quality request failed", exc_info=True)
 
     try:
@@ -539,7 +616,6 @@ def get_history():
             """).fetchall()
 
         return jsonify({"results": [dict(row) for row in rows]})
-
     except sqlite3.Error:
         app.logger.exception("Could not retrieve search history")
         return error_response("Could not retrieve search history.", 500)
@@ -553,7 +629,6 @@ def clear_history():
             db.commit()
 
         return jsonify({"message": "Search history cleared."})
-
     except sqlite3.Error:
         app.logger.exception("Could not clear search history")
         return error_response("Could not clear search history.", 500)
@@ -575,7 +650,6 @@ def get_favorites():
             """).fetchall()
 
         return jsonify({"results": [dict(row) for row in rows]})
-
     except sqlite3.Error:
         app.logger.exception("Could not retrieve favorites")
         return error_response("Could not retrieve favorite locations.", 500)
