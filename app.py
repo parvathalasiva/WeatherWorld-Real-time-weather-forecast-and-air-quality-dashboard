@@ -31,14 +31,18 @@ FORECAST_URL = "https://api.open-meteo.com/v1/forecast"
 AIR_QUALITY_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
 
 # In-memory API cache. Successful responses are reused to reduce API calls.
+
 API_CACHE = {}
-CACHE_MAX_ENTRIES = 200
+
 CACHE_TTLS = {
-    GEOCODING_URL: 3600,    # 1 hour
-    FORECAST_URL: 600,      # 10 minutes
-    AIR_QUALITY_URL: 1800,  # 30 minutes
+    GEOCODING_URL: 3600,
+    FORECAST_URL: 600,
+    AIR_QUALITY_URL: 1800,
 }
-STALE_CACHE_MAX_AGE = 21600  # Allow cached data up to 6 hours old on provider failure.
+
+# Permit cached results up to six hours old during provider failures.
+STALE_CACHE_MAX_AGE = 21600
+
 
 DEFAULT_LOCATION = {
     "name": "Kadapa",
@@ -174,84 +178,90 @@ def error_response(message, status_code=400):
 # API REQUESTS WITH CACHING AND RATE-LIMIT HANDLING
 # ============================================================
 
+
 def api_get(url, params):
     """
-    Fetch JSON from an API, cache successful results, and use cached
-    results when the provider is temporarily unavailable.
-
-    This avoids unnecessary repeat calls but cannot bypass a provider's
-    rate limits when no suitable cached response exists.
+    Fetch JSON from an API with caching and safe rate-limit handling.
+    Reuses cached results when possible and falls back to stale data
+    when the provider temporarily returns an error.
     """
+    import time
+    import requests
+
     cache_key = (
         url,
         tuple(sorted((str(k), str(v)) for k, v in params.items()))
     )
+
     now = time.time()
-    ttl = CACHE_TTLS.get(url, 300)
     cached = API_CACHE.get(cache_key)
 
-    # Return a fresh cached response without making another API request.
-    if cached and now - cached["saved_at"] < ttl:
-        return cached["data"]
+    # Use a fresh cached response when available.
+    ttl = CACHE_TTLS.get(url, 600)
+
+    if cached:
+        saved_at = cached.get("saved_at", 0)
+        cached_data = cached.get("data")
+
+        if cached_data is not None and now - saved_at < ttl:
+            return cached_data
 
     try:
         response = requests.get(
             url,
             params=params,
-            timeout=REQUEST_TIMEOUT,
-            headers={"User-Agent": "WeatherWorld/2.0"},
+            timeout=(5, 20),
+            headers={"User-Agent": "WeatherWorld/1.0"}
         )
 
-        # Do not repeatedly retry a 429 response.
+        # Do not repeatedly retry a provider that is rate-limiting us.
         if response.status_code == 429:
-            if cached and now - cached["saved_at"] < STALE_CACHE_MAX_AGE:
+            if cached and cached.get("data") is not None:
                 app.logger.warning(
-                    "API rate limited; returning cached data for %s", url
+                    "Open-Meteo rate limit reached; using cached response."
                 )
                 return cached["data"]
 
-            response.raise_for_status()
+            raise requests.HTTPError(
+                "Open-Meteo rate limit reached (HTTP 429). "
+                "No cached response is available.",
+                response=response
+            )
 
         response.raise_for_status()
         data = response.json()
 
-        if not isinstance(data, dict):
-            raise ValueError("Unexpected response from the weather provider.")
-
-        if data.get("error"):
-            raise ValueError(
-                clean_text(
-                    data.get("reason"),
-                    "Weather provider returned an error."
-                )
-            )
-
-        # Save successful responses.
+        # Save only successful JSON responses.
         API_CACHE[cache_key] = {
-            "saved_at": now,
-            "data": data,
+            "saved_at": time.time(),
+            "data": data
         }
 
         # Keep the in-memory cache bounded.
-        if len(API_CACHE) > CACHE_MAX_ENTRIES:
+        if len(API_CACHE) > 200:
             oldest_key = min(
                 API_CACHE,
-                key=lambda key: API_CACHE[key]["saved_at"]
+                key=lambda key: API_CACHE[key].get("saved_at", 0)
             )
             API_CACHE.pop(oldest_key, None)
 
         return data
 
     except requests.RequestException:
-        # If the provider fails, use recent cached data if available.
-        if cached and now - cached["saved_at"] < STALE_CACHE_MAX_AGE:
-            app.logger.warning(
-                "API request failed; returning cached data for %s", url
-            )
-            return cached["data"]
+        # If the API fails, use previously cached data where available.
+        if cached and cached.get("data") is not None:
+            saved_at = cached.get("saved_at", 0)
+            stale_limit = globals().get("STALE_CACHE_MAX_AGE", 21600)
 
-        app.logger.exception("API request failed for %s", url)
+            if time.time() - saved_at <= stale_limit:
+                app.logger.warning(
+                    "Weather provider failed; returning cached data."
+                )
+                return cached["data"]
+
+        app.logger.exception("Weather provider request failed")
         raise
+
 
 
 def location_from_args():
