@@ -317,55 +317,48 @@ def weather_description(code):
 # OPEN-METEO FORECAST
 # ============================================================
 
+
 def get_forecast(latitude, longitude, timezone_name="auto"):
+    """Request a smaller set of weather variables to reduce API usage."""
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "timezone": timezone_name,
+        "timezone": timezone_name or "auto",
         "forecast_days": 7,
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
-        "current": ",".join([
-            "temperature_2m",
-            "relative_humidity_2m",
-            "apparent_temperature",
-            "is_day",
-            "precipitation",
-            "rain",
-            "showers",
-            "snowfall",
-            "weather_code",
-            "cloud_cover",
-            "pressure_msl",
-            "surface_pressure",
-            "wind_speed_10m",
-            "wind_direction_10m",
-            "wind_gusts_10m",
-            "uv_index",
-        ]),
-        "hourly": ",".join([
-            "temperature_2m",
-            "relative_humidity_2m",
-            "precipitation_probability",
-            "precipitation",
-            "weather_code",
-            "wind_speed_10m",
-            "uv_index",
-        ]),
-        "daily": ",".join([
-            "weather_code",
-            "temperature_2m_max",
-            "temperature_2m_min",
-            "sunrise",
-            "sunset",
-            "uv_index_max",
-            "precipitation_sum",
-            "precipitation_probability_max",
-            "wind_speed_10m_max",
-        ]),
+
+        # Essential current conditions only
+        "current": (
+            "temperature_2m,"
+            "relative_humidity_2m,"
+            "apparent_temperature,"
+            "is_day,"
+            "precipitation,"
+            "weather_code,"
+            "wind_speed_10m"
+        ),
+
+        # Essential hourly forecast
+        "hourly": (
+            "temperature_2m,"
+            "precipitation_probability,"
+            "weather_code"
+        ),
+
+        # Essential 7-day forecast
+        "daily": (
+            "weather_code,"
+            "temperature_2m_max,"
+            "temperature_2m_min,"
+            "sunrise,"
+            "sunset"
+        ),
     }
+
     return api_get(FORECAST_URL, params)
+
 
 
 def get_air_quality(latitude, longitude, timezone_name="auto"):
