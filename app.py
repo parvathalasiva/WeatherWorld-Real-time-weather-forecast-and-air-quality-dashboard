@@ -749,6 +749,7 @@ def search_locations():
 
         return jsonify({"results": results})
 
+   
     except requests.Timeout:
         return error_response(
             "Location search timed out. Please try again.",
@@ -756,18 +757,14 @@ def search_locations():
         )
 
     except requests.RequestException as exc:
-        app.logger.warning(
-            "City search failed: %s", exc
-        )
+        app.logger.exception("Location search failed: %s", exc)
         return error_response(
-            "City search is temporarily unavailable.",
+            "Location search failed. Please try again later.",
             502,
         )
 
     except ValueError:
-        app.logger.exception(
-            "Invalid city search response"
-        )
+        app.logger.exception("Invalid city search response")
         return error_response(
             "The location service returned invalid data.",
             502,
