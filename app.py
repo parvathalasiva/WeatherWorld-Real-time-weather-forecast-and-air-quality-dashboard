@@ -705,71 +705,84 @@ def provider_health():
 # LOCATION SEARCH
 # ==================================================
 
-@app.get("/api/search")
+@app.route("/api/search", methods=["GET"])
 def search_locations():
-    query = clean_text(
-        request.args.get("q"),
-        "",
-        100,
-    )
+    query = request.args.get("q", "").strip()
 
     if len(query) < 2:
-        return jsonify({"results": []})
+        return jsonify({"results": []}), 200
+
+    params = {
+        "name": query,
+        "count": 8,
+        "language": "en",
+        "format": "json",
+    }
 
     try:
-        data = api_get(
+        response = requests.get(
             GEOCODING_URL,
-            {
-                "name": query,
-                "count": 8,
-                "language": "en",
-                "format": "json",
-            },
-            "geocoding",
+            params=params,
+            timeout=(5, 15),
+            headers={"User-Agent": "WeatherWorld/1.0"},
         )
 
+        if response.status_code == 429:
+            return jsonify({
+                "error": "Location search is temporarily rate-limited. Please wait and try again.",
+                "results": [],
+            }), 503
+
+        response.raise_for_status()
+        payload = response.json()
+
+        if not isinstance(payload, dict):
+            raise ValueError("Invalid location search response")
+
+        locations = payload.get("results") or []
         results = []
 
-        for item in data.get("results", []):
-            if (
-                item.get("latitude") is None
-                or item.get("longitude") is None
-            ):
+        for item in locations:
+            if not isinstance(item, dict):
+                continue
+
+            latitude = item.get("latitude")
+            longitude = item.get("longitude")
+
+            if latitude is None or longitude is None:
                 continue
 
             results.append({
                 "name": item.get("name", "Unknown"),
                 "country": item.get("country", ""),
-                "country_code": item.get("country_code", ""),
                 "admin1": item.get("admin1", ""),
-                "latitude": item["latitude"],
-                "longitude": item["longitude"],
+                "latitude": latitude,
+                "longitude": longitude,
                 "timezone": item.get("timezone", "auto"),
             })
 
-        return jsonify({"results": results})
+        return jsonify({"results": results}), 200
 
-   
     except requests.Timeout:
-        return error_response(
-            "Location search timed out. Please try again.",
-            504,
-        )
+        app.logger.warning("Location search timed out")
+        return jsonify({
+            "error": "Location search timed out. Please try again.",
+            "results": [],
+        }), 504
 
-    
     except requests.RequestException:
-        app.logger.exception("Location search request failed")
-        return error_response(
-            "Location search failed. Please try again later.",
-            502,
-        )
+        app.logger.exception("Location provider request failed")
+        return jsonify({
+            "error": "Location service is temporarily unavailable.",
+            "results": [],
+        }), 502
 
-    except ValueError:
-        app.logger.exception("Invalid city search response")
-        return error_response(
-            "The location service returned invalid data.",
-            502,
-        )
+    except (ValueError, TypeError):
+        app.logger.exception("Invalid location search response")
+        return jsonify({
+            "error": "The location service returned invalid data.",
+            "results": [],
+        }), 502
 
 
 # ==================================================
