@@ -756,8 +756,9 @@ def search_locations():
             504,
         )
 
-    except requests.RequestException as exc:
-        app.logger.exception("Location search failed: %s", exc)
+    
+    except requests.RequestException:
+        app.logger.exception("Location search request failed")
         return error_response(
             "Location search failed. Please try again later.",
             502,
