@@ -328,43 +328,48 @@ def weather_description(code):
 # ============================================================
 
 
-def get_forecast(latitude, longitude, timezone_name="auto"):
-    """Request a smaller set of weather variables to reduce API usage."""
+
+def get_forecast(latitude, longitude, timezone="auto"):
+    """Fetch a lighter forecast to reduce Open-Meteo API usage."""
+
     params = {
         "latitude": latitude,
         "longitude": longitude,
-        "timezone": timezone_name or "auto",
+        "timezone": timezone,
         "forecast_days": 7,
+
+        # Keep the current-weather request small.
+        "current": ",".join([
+            "temperature_2m",
+            "relative_humidity_2m",
+            "apparent_temperature",
+            "is_day",
+            "precipitation",
+            "weather_code",
+            "wind_speed_10m",
+        ]),
+
+        # Request only essential hourly forecast data.
+        "hourly": ",".join([
+            "temperature_2m",
+            "precipitation_probability",
+            "weather_code",
+            "wind_speed_10m",
+        ]),
+
+        # Keep the 7-day forecast useful but lightweight.
+        "daily": ",".join([
+            "weather_code",
+            "temperature_2m_max",
+            "temperature_2m_min",
+            "sunrise",
+            "sunset",
+            "uv_index_max",
+        ]),
+
         "temperature_unit": "celsius",
         "wind_speed_unit": "kmh",
         "precipitation_unit": "mm",
-
-        # Essential current conditions only
-        "current": (
-            "temperature_2m,"
-            "relative_humidity_2m,"
-            "apparent_temperature,"
-            "is_day,"
-            "precipitation,"
-            "weather_code,"
-            "wind_speed_10m"
-        ),
-
-        # Essential hourly forecast
-        "hourly": (
-            "temperature_2m,"
-            "precipitation_probability,"
-            "weather_code"
-        ),
-
-        # Essential 7-day forecast
-        "daily": (
-            "weather_code,"
-            "temperature_2m_max,"
-            "temperature_2m_min,"
-            "sunrise,"
-            "sunset"
-        ),
     }
 
     return api_get(FORECAST_URL, params)
