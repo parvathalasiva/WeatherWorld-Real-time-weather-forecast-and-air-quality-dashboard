@@ -179,12 +179,9 @@ def error_response(message, status_code=400):
 # ============================================================
 
 
+
 def api_get(url, params):
-    """
-    Fetch JSON from an API with caching and safe rate-limit handling.
-    Reuses cached results when possible and falls back to stale data
-    when the provider temporarily returns an error.
-    """
+    """Fetch JSON with caching, retries, and stale-cache fallback."""
     import time
     import requests
 
@@ -196,71 +193,52 @@ def api_get(url, params):
     now = time.time()
     cached = API_CACHE.get(cache_key)
 
-    # Use a fresh cached response when available.
-    ttl = CACHE_TTLS.get(url, 600)
-
+    # Return a fresh cached response when available.
     if cached:
         saved_at = cached.get("saved_at", 0)
-        cached_data = cached.get("data")
+        ttl = CACHE_TTLS.get(url, 600)
 
-        if cached_data is not None and now - saved_at < ttl:
-            return cached_data
+        if now - saved_at < ttl:
+            return cached["data"]
 
-    try:
-        response = requests.get(
-            url,
-            params=params,
-            timeout=(5, 20),
-            headers={"User-Agent": "WeatherWorld/1.0"}
-        )
-
-        # Do not repeatedly retry a provider that is rate-limiting us.
-        if response.status_code == 429:
-            if cached and cached.get("data") is not None:
-                app.logger.warning(
-                    "Open-Meteo rate limit reached; using cached response."
-                )
-                return cached["data"]
-
-            raise requests.HTTPError(
-                "Open-Meteo rate limit reached (HTTP 429). "
-                "No cached response is available.",
-                response=response
+    # Retry only a limited number of times.
+    for attempt in range(2):
+        try:
+            response = requests.get(
+                url,
+                params=params,
+                timeout=20,
+                headers={"User-Agent": "WeatherWorld/1.0"}
             )
 
-        response.raise_for_status()
-        data = response.json()
+            if response.status_code == 429:
+                # Do not keep repeatedly calling a rate-limited API.
+                break
 
-        # Save only successful JSON responses.
-        API_CACHE[cache_key] = {
-            "saved_at": time.time(),
-            "data": data
-        }
+            response.raise_for_status()
+            data = response.json()
 
-        # Keep the in-memory cache bounded.
-        if len(API_CACHE) > 200:
-            oldest_key = min(
-                API_CACHE,
-                key=lambda key: API_CACHE[key].get("saved_at", 0)
-            )
-            API_CACHE.pop(oldest_key, None)
+            API_CACHE[cache_key] = {
+                "data": data,
+                "saved_at": time.time()
+            }
+            return data
 
-        return data
+        except requests.RequestException:
+            if attempt == 0:
+                time.sleep(2)
+            else:
+                app.logger.exception("Weather provider request failed")
 
-    except requests.RequestException:
-        # If the API fails, use previously cached data where available.
-        if cached and cached.get("data") is not None:
-            saved_at = cached.get("saved_at", 0)
-            stale_limit = globals().get("STALE_CACHE_MAX_AGE", 21600)
+    # A stale result can keep the dashboard usable temporarily.
+    if cached and now - cached.get("saved_at", 0) < 21600:
+        app.logger.warning("Using stale cached weather data")
+        return cached["data"]
 
-            if time.time() - saved_at <= stale_limit:
-                app.logger.warning(
-                    "Weather provider failed; returning cached data."
-                )
-                return cached["data"]
-
-        app.logger.exception("Weather provider request failed")
-        raise
+    raise RuntimeError(
+        "Open-Meteo rate limit reached or weather provider unavailable. "
+        "Please try again later."
+    )
 
 
 
