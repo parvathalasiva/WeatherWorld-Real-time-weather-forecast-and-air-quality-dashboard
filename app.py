@@ -1,35 +1,39 @@
+
 import csv
+import hashlib
 import io
 import json
 import logging
-import math
 import os
 import sqlite3
 import time
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from threading import Lock
+from threading import Lock, Event
 
 import requests
 from flask import Flask, Response, jsonify, render_template, request
 
-# ==================================================
-# APPLICATION CONFIGURATION
-# ==================================================
+# =========================================================
+# 1. APPLICATION CONFIGURATION
+# =========================================================
 
 app = Flask(__name__)
 app.config["JSON_SORT_KEYS"] = False
 app.config["MAX_CONTENT_LENGTH"] = 1024 * 1024
 
 logging.basicConfig(
-    level=os.environ.get("LOG_LEVEL", "INFO")
+    level=os.environ.get("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
+
 app.logger.setLevel(os.environ.get("LOG_LEVEL", "INFO"))
 
 DATABASE_PATH = os.environ.get(
-    "DATABASE_PATH", "weather_history.db"
+    "DATABASE_PATH",
+    "weather_history.db",
 )
-REQUEST_TIMEOUT = (5, 20)
 
 GEOCODING_URL = (
     "https://geocoding-api.open-meteo.com/v1/search"
@@ -39,28 +43,32 @@ AIR_QUALITY_URL = (
     "https://air-quality-api.open-meteo.com/v1/air-quality"
 )
 
-CACHE_TTLS = {
-    "geocoding": 3600,
-    "forecast": 900,
-    "air_quality": 1800,
-}
+REQUEST_TIMEOUT = (5, 15)
 
-# Keep successful cached data for up to six hours
-# if the weather provider is temporarily unavailable.
-STALE_CACHE_MAX_AGE = 6 * 60 * 60
+# Cache durations
+GEOCODING_TTL = 60 * 60
+FORECAST_TTL = 15 * 60
+AIR_QUALITY_TTL = 30 * 60
 
-# Do not repeatedly contact a rate-limited endpoint.
+# Serve previously successful data for up to six hours
+# when a fresh request cannot be completed.
+STALE_CACHE_TTL = 6 * 60 * 60
+
 DEFAULT_COOLDOWN = 60
-MAX_COOLDOWN = 1800
+MAX_COOLDOWN = 30 * 60
 
-MEMORY_CACHE = {}
+# In-memory synchronization and cooldowns.
+# These coordinate threads within this Python process.
 CACHE_LOCK = Lock()
+REQUEST_LOCKS_LOCK = Lock()
+COOLDOWN_LOCK = Lock()
 
-API_REQUEST_LOCKS = {}
-API_REQUEST_LOCKS_LOCK = Lock()
+REQUEST_LOCKS = {}
+COOLDOWNS = {}
+INFLIGHT = {}
 
-API_COOLDOWNS = {}
-API_COOLDOWNS_LOCK = Lock()
+# Avoid accumulating too many in-memory entries.
+MAX_MEMORY_CACHE_ENTRIES = 300
 
 http = requests.Session()
 http.headers.update({
@@ -106,9 +114,9 @@ def utc_now():
     )
 
 
-# ==================================================
-# DATABASE
-# ==================================================
+# =========================================================
+# 2. SQLITE DATABASE
+# =========================================================
 
 def connect_db():
     if DATABASE_PATH != ":memory:":
@@ -127,8 +135,21 @@ def connect_db():
     return db
 
 
+@contextmanager
+def database():
+    db = connect_db()
+    try:
+        yield db
+        db.commit()
+    except Exception:
+        db.rollback()
+        raise
+    finally:
+        db.close()
+
+
 def initialize_database():
-    with connect_db() as db:
+    with database() as db:
         db.execute("""
             CREATE TABLE IF NOT EXISTS favorites (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -137,8 +158,7 @@ def initialize_database():
                 latitude REAL NOT NULL,
                 longitude REAL NOT NULL,
                 timezone TEXT NOT NULL DEFAULT 'auto',
-                created_at TEXT NOT NULL,
-                UNIQUE(latitude, longitude)
+                created_at TEXT NOT NULL
             )
         """)
 
@@ -168,12 +188,15 @@ def initialize_database():
             )
         """)
 
-        db.commit()
+        db.execute("""
+            CREATE INDEX IF NOT EXISTS idx_api_cache_saved_at
+            ON api_cache(saved_at)
+        """)
 
 
-# ==================================================
-# VALIDATION AND RESPONSES
-# ==================================================
+# =========================================================
+# 3. VALIDATION AND JSON RESPONSES
+# =========================================================
 
 def clean_text(value, default="", max_length=150):
     if value is None:
@@ -187,24 +210,18 @@ def parse_coordinate(value, field):
     try:
         number = float(value)
     except (TypeError, ValueError):
-        raise ValueError(
-            f"Please provide a valid {field}."
-        )
+        raise ValueError(f"Please provide a valid {field}.")
+
+    import math
 
     if not math.isfinite(number):
-        raise ValueError(
-            f"{field.capitalize()} must be a finite number."
-        )
+        raise ValueError(f"{field.capitalize()} must be finite.")
 
     if field == "latitude" and not -90 <= number <= 90:
-        raise ValueError(
-            "Latitude must be between -90 and 90."
-        )
+        raise ValueError("Latitude must be between -90 and 90.")
 
     if field == "longitude" and not -180 <= number <= 180:
-        raise ValueError(
-            "Longitude must be between -180 and 180."
-        )
+        raise ValueError("Longitude must be between -180 and 180.")
 
     return number
 
@@ -219,16 +236,12 @@ def location_from_args():
             request.args.get("name"),
             "Selected location",
         ),
-        "country": clean_text(
-            request.args.get("country"), ""
-        ),
+        "country": clean_text(request.args.get("country")),
         "latitude": parse_coordinate(
-            request.args.get("latitude"),
-            "latitude",
+            request.args.get("latitude"), "latitude"
         ),
         "longitude": parse_coordinate(
-            request.args.get("longitude"),
-            "longitude",
+            request.args.get("longitude"), "longitude"
         ),
         "timezone": clean_text(
             request.args.get("timezone"),
@@ -240,12 +253,8 @@ def location_from_args():
 
 def location_from_json(body):
     return {
-        "name": clean_text(
-            body.get("name"), "Saved location"
-        ),
-        "country": clean_text(
-            body.get("country"), ""
-        ),
+        "name": clean_text(body.get("name"), "Saved location"),
+        "country": clean_text(body.get("country")),
         "latitude": parse_coordinate(
             body.get("latitude"), "latitude"
         ),
@@ -258,31 +267,35 @@ def location_from_json(body):
     }
 
 
-# ==================================================
-# CACHING
-# ==================================================
+# =========================================================
+# 4. PERSISTENT API CACHE
+# =========================================================
 
 def make_cache_key(url, params):
-    normalized = sorted(
+    normalized_params = sorted(
         (str(key), str(value))
         for key, value in (params or {}).items()
     )
 
-    return url + "?" + json.dumps(
-        normalized,
+    canonical = json.dumps(
+        {"url": url, "params": normalized_params},
+        sort_keys=True,
         separators=(",", ":"),
     )
 
+    return hashlib.sha256(
+        canonical.encode("utf-8")
+    ).hexdigest()
+
 
 def read_cache(key):
-    with CACHE_LOCK:
-        item = MEMORY_CACHE.get(key)
-
-    if item is not None:
-        return item
-
     try:
-        with connect_db() as db:
+        with CACHE_LOCK:
+            # Read SQLite too, because another worker may have
+            # updated the persisted cache after our last read.
+            pass
+
+        with database() as db:
             row = db.execute(
                 """
                 SELECT saved_at, payload
@@ -292,46 +305,50 @@ def read_cache(key):
                 (key,),
             ).fetchone()
 
-        if row:
-            item = {
-                "saved_at": float(row["saved_at"]),
-                "data": json.loads(row["payload"]),
-            }
+        if not row:
+            return None
 
-            with CACHE_LOCK:
-                MEMORY_CACHE[key] = item
+        payload = json.loads(row["payload"])
 
-            return item
+        if not isinstance(payload, dict):
+            return None
+
+        entry = {
+            "saved_at": float(row["saved_at"]),
+            "data": payload,
+        }
+
+        with CACHE_LOCK:
+            MEMORY_CACHE = globals().setdefault(
+                "_WEATHER_MEMORY_CACHE", {}
+            )
+            MEMORY_CACHE[key] = entry
+
+            if len(MEMORY_CACHE) > MAX_MEMORY_CACHE_ENTRIES:
+                oldest_key = min(
+                    MEMORY_CACHE,
+                    key=lambda k: MEMORY_CACHE[k]["saved_at"],
+                )
+                MEMORY_CACHE.pop(oldest_key, None)
+
+        return entry
 
     except (sqlite3.Error, ValueError, TypeError):
         app.logger.warning(
-            "Could not read API cache",
+            "Could not read weather cache.",
             exc_info=True,
         )
+        return None
 
-    return None
 
-
-def write_cache(key, cache_type, data):
-    item = {
+def write_cache(key, cache_type, payload):
+    entry = {
         "saved_at": time.time(),
-        "data": data,
+        "data": payload,
     }
 
-    with CACHE_LOCK:
-        MEMORY_CACHE[key] = item
-
-        if len(MEMORY_CACHE) > 300:
-            oldest_key = min(
-                MEMORY_CACHE,
-                key=lambda cache_key: (
-                    MEMORY_CACHE[cache_key]["saved_at"]
-                ),
-            )
-            MEMORY_CACHE.pop(oldest_key, None)
-
     try:
-        with connect_db() as db:
+        with database() as db:
             db.execute(
                 """
                 INSERT INTO api_cache
@@ -345,55 +362,67 @@ def write_cache(key, cache_type, data):
                 (
                     key,
                     cache_type,
-                    item["saved_at"],
-                    json.dumps(data),
+                    entry["saved_at"],
+                    json.dumps(payload, separators=(",", ":")),
                 ),
             )
 
-            # Keep the newest 250 cached responses.
+            # Bound cache database growth.
             db.execute("""
                 DELETE FROM api_cache
                 WHERE cache_key IN (
                     SELECT cache_key
                     FROM api_cache
                     ORDER BY saved_at DESC
-                    LIMIT -1 OFFSET 250
+                    LIMIT -1 OFFSET 500
                 )
             """)
 
-            db.commit()
+        with CACHE_LOCK:
+            memory = globals().setdefault(
+                "_WEATHER_MEMORY_CACHE", {}
+            )
+            memory[key] = entry
+
+            if len(memory) > MAX_MEMORY_CACHE_ENTRIES:
+                oldest_key = min(
+                    memory,
+                    key=lambda k: memory[k]["saved_at"],
+                )
+                memory.pop(oldest_key, None)
 
     except sqlite3.Error:
+        # The API response is still usable if cache storage fails.
         app.logger.warning(
-            "Could not persist API cache",
+            "Could not persist weather cache.",
             exc_info=True,
         )
 
 
 def get_request_lock(key):
-    with API_REQUEST_LOCKS_LOCK:
-        lock = API_REQUEST_LOCKS.get(key)
+    with REQUEST_LOCKS_LOCK:
+        lock = REQUEST_LOCKS.get(key)
 
         if lock is None:
             lock = Lock()
-            API_REQUEST_LOCKS[key] = lock
+            REQUEST_LOCKS[key] = lock
 
         return lock
 
 
-def get_cooldown(url):
-    with API_COOLDOWNS_LOCK:
-        return API_COOLDOWNS.get(url, 0)
+def cooldown_until(url):
+    with COOLDOWN_LOCK:
+        return COOLDOWNS.get(url, 0)
 
 
 def set_cooldown(url, seconds):
-    with API_COOLDOWNS_LOCK:
-        API_COOLDOWNS[url] = (
-            time.time() + max(1, min(seconds, MAX_COOLDOWN))
-        )
+    seconds = max(1, min(seconds, MAX_COOLDOWN))
+
+    with COOLDOWN_LOCK:
+        COOLDOWNS[url] = time.time() + seconds
 
 
-def parse_retry_after(response):
+def get_retry_after(response):
     value = response.headers.get("Retry-After")
 
     if value:
@@ -408,20 +437,24 @@ def parse_retry_after(response):
     return DEFAULT_COOLDOWN
 
 
-def api_get(url, params, cache_type="forecast"):
+def api_get(url, params=None, cache_type="forecast"):
     """
-    Get provider JSON with persistent caching.
+    Cache provider responses in SQLite.
 
-    1. Use fresh cached data when possible.
-    2. Serialize refreshes for identical requests.
-    3. Never retry a 429 immediately.
-    4. Respect the provider cooldown.
-    5. Return stale successful data for up to six hours
-       if the provider is unavailable.
+    For each identical request, this function checks the cache,
+    serializes refreshes within this process, respects provider
+    cooldowns, and falls back to successful stale data.
     """
     params = params or {}
+
+    ttl_by_type = {
+        "geocoding": GEOCODING_TTL,
+        "forecast": FORECAST_TTL,
+        "air_quality": AIR_QUALITY_TTL,
+    }
+
+    ttl = ttl_by_type.get(cache_type, FORECAST_TTL)
     key = make_cache_key(url, params)
-    ttl = CACHE_TTLS.get(cache_type, 900)
 
     cached = read_cache(key)
     now = time.time()
@@ -430,24 +463,19 @@ def api_get(url, params, cache_type="forecast"):
         return cached["data"]
 
     with get_request_lock(key):
-        # Another request may have refreshed the cache.
+        # Recheck after acquiring the lock: another thread may
+        # have completed the same request while we were waiting.
         cached = read_cache(key)
         now = time.time()
 
         if cached and now - cached["saved_at"] < ttl:
             return cached["data"]
 
-        cooldown_until = get_cooldown(url)
-
-        if now < cooldown_until:
-            if (
-                cached
-                and now - cached["saved_at"]
-                <= STALE_CACHE_MAX_AGE
-            ):
-                app.logger.warning(
-                    "Provider cooldown active; "
-                    "serving cached data."
+        # If the provider is in cooldown, don't contact it again.
+        if now < cooldown_until(url):
+            if cached and now - cached["saved_at"] <= STALE_CACHE_TTL:
+                app.logger.info(
+                    "Serving stale cached data during provider cooldown."
                 )
                 return cached["data"]
 
@@ -463,59 +491,56 @@ def api_get(url, params, cache_type="forecast"):
             )
 
             if response.status_code == 429:
-                set_cooldown(
-                    url,
-                    parse_retry_after(response),
-                )
+                set_cooldown(url, get_retry_after(response))
 
                 app.logger.warning(
-                    "Provider returned HTTP 429. "
-                    "Cooldown enabled."
+                    "HTTP 429 from %s; cooldown activated.",
+                    url,
                 )
 
                 if (
                     cached
                     and time.time() - cached["saved_at"]
-                    <= STALE_CACHE_MAX_AGE
+                    <= STALE_CACHE_TTL
                 ):
                     return cached["data"]
 
                 response.raise_for_status()
 
             response.raise_for_status()
-            data = response.json()
+            payload = response.json()
 
-            if not isinstance(data, dict) or data.get("error"):
-                reason = (
-                    data.get("reason", "Invalid provider response.")
-                    if isinstance(data, dict)
-                    else "Invalid provider response."
-                )
+            if not isinstance(payload, dict):
+                raise ValueError("Invalid JSON response from provider.")
+
+            if payload.get("error"):
                 raise ValueError(
                     clean_text(
-                        reason,
-                        "Invalid provider response.",
+                        payload.get("reason"),
+                        "Provider returned an error.",
                         250,
                     )
                 )
 
-            write_cache(key, cache_type, data)
+            write_cache(key, cache_type, payload)
 
-            with API_COOLDOWNS_LOCK:
-                API_COOLDOWNS.pop(url, None)
+            with COOLDOWN_LOCK:
+                COOLDOWNS.pop(url, None)
 
-            return data
+            return payload
 
         except (requests.RequestException, ValueError):
+            # Refresh cache from SQLite in case it was written by
+            # another worker since the initial read.
             cached = read_cache(key)
 
             if (
                 cached
                 and time.time() - cached["saved_at"]
-                <= STALE_CACHE_MAX_AGE
+                <= STALE_CACHE_TTL
             ):
                 app.logger.warning(
-                    "Provider unavailable; using cached data.",
+                    "Provider failed; returning cached data.",
                     exc_info=True,
                 )
                 return cached["data"]
@@ -523,9 +548,9 @@ def api_get(url, params, cache_type="forecast"):
             raise
 
 
-# ==================================================
-# WEATHER DATA
-# ==================================================
+# =========================================================
+# 5. WEATHER PROVIDER HELPERS
+# =========================================================
 
 def weather_description(code):
     try:
@@ -537,11 +562,7 @@ def weather_description(code):
         return ("Unknown conditions", "🌡️")
 
 
-def get_forecast(
-    latitude,
-    longitude,
-    timezone_name="auto",
-):
+def get_forecast(latitude, longitude, timezone_name="auto"):
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -573,11 +594,7 @@ def get_forecast(
     )
 
 
-def get_air_quality(
-    latitude,
-    longitude,
-    timezone_name="auto",
-):
+def get_air_quality(latitude, longitude, timezone_name="auto"):
     params = {
         "latitude": latitude,
         "longitude": longitude,
@@ -598,12 +615,12 @@ def get_air_quality(
     return data.get("current")
 
 
-# ==================================================
-# SEARCH HISTORY
-# ==================================================
+# =========================================================
+# 6. SEARCH HISTORY
+# =========================================================
 
 def record_search(location):
-    with connect_db() as db:
+    with database() as db:
         db.execute(
             """
             INSERT INTO search_history
@@ -631,12 +648,10 @@ def record_search(location):
             )
         """)
 
-        db.commit()
 
-
-# ==================================================
-# MAIN PAGE AND HEALTH CHECKS
-# ==================================================
+# =========================================================
+# 7. MAIN PAGE AND HEALTH CHECKS
+# =========================================================
 
 @app.get("/")
 def index():
@@ -646,7 +661,7 @@ def index():
 @app.get("/api/health")
 def health():
     try:
-        with connect_db() as db:
+        with database() as db:
             db.execute("SELECT 1").fetchone()
 
         return jsonify({
@@ -657,13 +672,10 @@ def health():
         })
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Database health check failed"
-        )
+        app.logger.exception("Health check failed")
 
         return jsonify({
             "status": "error",
-            "service": "WeatherWorld",
             "database": "error",
             "timestamp": utc_now(),
         }), 503
@@ -688,106 +700,107 @@ def provider_health():
             "provider": "Open-Meteo",
         })
 
-    except (requests.RequestException, ValueError):
+    except requests.Timeout:
+        return error_response(
+            "Weather provider timed out.",
+            504,
+        )
+
+    except requests.RequestException:
         app.logger.warning(
-            "Provider health check failed",
+            "Provider health check failed.",
             exc_info=True,
         )
-
-        return jsonify({
-            "status": "offline",
-            "provider": "Open-Meteo",
-            "message": "Weather provider unavailable.",
-        }), 503
-
-
-# ==================================================
-# LOCATION SEARCH
-# ==================================================
-
-@app.route("/api/search", methods=["GET"])
-def search_locations():
-    query = request.args.get("q", "").strip()
-
-    if len(query) < 2:
-        return jsonify({"results": []}), 200
-
-    params = {
-        "name": query,
-        "count": 8,
-        "language": "en",
-        "format": "json",
-    }
-
-    try:
-        response = requests.get(
-            GEOCODING_URL,
-            params=params,
-            timeout=(5, 15),
-            headers={"User-Agent": "WeatherWorld/1.0"},
+        return error_response(
+            "Weather provider is temporarily unavailable.",
+            503,
         )
 
-        if response.status_code == 429:
-            return jsonify({
-                "error": "Location search is temporarily rate-limited. Please wait and try again.",
-                "results": [],
-            }), 503
+    except ValueError:
+        app.logger.exception(
+            "Invalid provider health response"
+        )
+        return error_response(
+            "Invalid provider response.",
+            502,
+        )
 
-        response.raise_for_status()
-        payload = response.json()
 
-        if not isinstance(payload, dict):
-            raise ValueError("Invalid location search response")
+# =========================================================
+# 8. LOCATION SEARCH
+# =========================================================
 
-        locations = payload.get("results") or []
+@app.get("/api/search")
+def search_locations():
+    query = clean_text(
+        request.args.get("q"),
+        "",
+        100,
+    )
+
+    if len(query) < 2:
+        return jsonify({"results": []})
+
+    try:
+        data = api_get(
+            GEOCODING_URL,
+            {
+                "name": query,
+                "count": 8,
+                "language": "en",
+                "format": "json",
+            },
+            "geocoding",
+        )
+
         results = []
 
-        for item in locations:
+        for item in data.get("results", []) or []:
             if not isinstance(item, dict):
                 continue
 
-            latitude = item.get("latitude")
-            longitude = item.get("longitude")
-
-            if latitude is None or longitude is None:
+            if (
+                item.get("latitude") is None
+                or item.get("longitude") is None
+            ):
                 continue
 
             results.append({
                 "name": item.get("name", "Unknown"),
                 "country": item.get("country", ""),
+                "country_code": item.get("country_code", ""),
                 "admin1": item.get("admin1", ""),
-                "latitude": latitude,
-                "longitude": longitude,
+                "latitude": item["latitude"],
+                "longitude": item["longitude"],
                 "timezone": item.get("timezone", "auto"),
             })
 
-        return jsonify({"results": results}), 200
+        return jsonify({"results": results})
 
     except requests.Timeout:
-        app.logger.warning("Location search timed out")
-        return jsonify({
-            "error": "Location search timed out. Please try again.",
-            "results": [],
-        }), 504
+        return error_response(
+            "Location search timed out. Please try again.",
+            504,
+        )
 
     except requests.RequestException:
-        app.logger.exception("Location provider request failed")
-        return jsonify({
-            "error": "Location service is temporarily unavailable.",
-            "results": [],
-        }), 502
+        app.logger.exception("Location search failed")
+        return error_response(
+            "Location service is temporarily unavailable.",
+            503,
+        )
 
-    except (ValueError, TypeError):
-        app.logger.exception("Invalid location search response")
-        return jsonify({
-            "error": "The location service returned invalid data.",
-            "results": [],
-        }), 502
+    except ValueError:
+        app.logger.exception("Invalid location response")
+        return error_response(
+            "The location service returned invalid data.",
+            502,
+        )
 
 
-# ==================================================
-# CURRENT WEATHER AND FORECAST
-# ==================================================
+# =========================================================
+# 9. CURRENT WEATHER, FORECAST, AND AIR QUALITY
+# =========================================================
 
 @app.get("/api/weather")
 def weather():
@@ -806,13 +819,13 @@ def weather():
 
     except requests.Timeout:
         return error_response(
-            "Weather service timed out. Please retry.",
+            "Weather service timed out. Please try again.",
             504,
         )
 
     except requests.RequestException as exc:
         app.logger.warning(
-            "Weather provider request failed: %s", exc
+            "Weather request failed: %s", exc
         )
 
         if (
@@ -820,28 +833,24 @@ def weather():
             and getattr(exc.response, "status_code", None) == 429
         ):
             return error_response(
-                "Open-Meteo is rate-limiting requests. "
-                "Please wait and try again.",
+                "Weather provider is rate-limited. "
+                "Please wait before retrying.",
                 503,
             )
 
         return error_response(
-            "Could not retrieve weather data. "
-            "Please try again later.",
-            502,
+            "Could not retrieve weather data. Please try again later.",
+            503,
         )
 
     except ValueError:
-        app.logger.exception(
-            "Invalid weather response"
-        )
+        app.logger.exception("Invalid weather response")
         return error_response(
             "The weather service returned invalid data.",
             502,
         )
 
     current = dict(data.get("current") or {})
-
     description, icon = weather_description(
         current.get("weather_code")
     )
@@ -870,10 +879,10 @@ def weather():
 
     try:
         record_search(location)
-
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not save search history"
+        app.logger.warning(
+            "Could not save search history",
+            exc_info=True,
         )
 
     return jsonify({
@@ -888,14 +897,14 @@ def weather():
     })
 
 
-# ==================================================
-# HISTORY ENDPOINTS
-# ==================================================
+# =========================================================
+# 10. SEARCH HISTORY API
+# =========================================================
 
 @app.get("/api/history")
 def get_history():
     try:
-        with connect_db() as db:
+        with database() as db:
             rows = db.execute("""
                 SELECT id, name, country, latitude, longitude,
                        timezone, searched_at
@@ -909,42 +918,39 @@ def get_history():
         })
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not retrieve history"
-        )
+        app.logger.exception("Could not retrieve history")
         return error_response(
-            "Could not retrieve search history.", 500
+            "Could not retrieve search history.",
+            500,
         )
 
 
 @app.delete("/api/history")
 def clear_history():
     try:
-        with connect_db() as db:
+        with database() as db:
             db.execute("DELETE FROM search_history")
-            db.commit()
 
         return jsonify({
             "message": "Search history cleared."
         })
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not clear history"
-        )
+        app.logger.exception("Could not clear history")
         return error_response(
-            "Could not clear search history.", 500
+            "Could not clear search history.",
+            500,
         )
 
 
-# ==================================================
-# FAVORITES ENDPOINTS
-# ==================================================
+# =========================================================
+# 11. FAVORITES API
+# =========================================================
 
 @app.get("/api/favorites")
 def get_favorites():
     try:
-        with connect_db() as db:
+        with database() as db:
             rows = db.execute("""
                 SELECT id, name, country, latitude, longitude,
                        timezone, created_at
@@ -957,11 +963,10 @@ def get_favorites():
         })
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not retrieve favorites"
-        )
+        app.logger.exception("Could not retrieve favorites")
         return error_response(
-            "Could not retrieve favorites.", 500
+            "Could not retrieve favorites.",
+            500,
         )
 
 
@@ -971,7 +976,8 @@ def add_favorite():
 
     if not isinstance(body, dict):
         return error_response(
-            "A JSON location object is required.", 400
+            "A JSON location object is required.",
+            400,
         )
 
     try:
@@ -981,7 +987,7 @@ def add_favorite():
         return error_response(str(exc), 400)
 
     try:
-        with connect_db() as db:
+        with database() as db:
             existing = db.execute(
                 """
                 SELECT id FROM favorites
@@ -1016,41 +1022,43 @@ def add_favorite():
                 ),
             )
 
-            db.commit()
+            favorite_id = cursor.lastrowid
 
         return jsonify({
             "message": "Location saved to favorites.",
-            "id": cursor.lastrowid,
+            "id": favorite_id,
             "location": location,
         }), 201
 
     except sqlite3.IntegrityError:
         return error_response(
-            "This location is already saved.", 409
+            "Could not save this favorite.",
+            409,
         )
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not save favorite"
-        )
+        app.logger.exception("Could not save favorite")
         return error_response(
-            "Could not save favorite.", 500
+            "Could not save favorite.",
+            500,
         )
 
 
 @app.delete("/api/favorites/<int:favorite_id>")
 def delete_favorite(favorite_id):
     try:
-        with connect_db() as db:
+        with database() as db:
             cursor = db.execute(
                 "DELETE FROM favorites WHERE id = ?",
                 (favorite_id,),
             )
-            db.commit()
 
-        if cursor.rowcount == 0:
+            deleted = cursor.rowcount
+
+        if deleted == 0:
             return error_response(
-                "Favorite not found.", 404
+                "Favorite not found.",
+                404,
             )
 
         return jsonify({
@@ -1058,22 +1066,21 @@ def delete_favorite(favorite_id):
         })
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not delete favorite"
-        )
+        app.logger.exception("Could not delete favorite")
         return error_response(
-            "Could not remove favorite.", 500
+            "Could not remove favorite.",
+            500,
         )
 
 
-# ==================================================
-# CSV EXPORT
-# ==================================================
+# =========================================================
+# 12. CSV EXPORT
+# =========================================================
 
 @app.get("/api/export")
 def export_history():
     try:
-        with connect_db() as db:
+        with database() as db:
             rows = db.execute("""
                 SELECT name, country, latitude, longitude,
                        timezone, searched_at
@@ -1114,24 +1121,21 @@ def export_history():
         )
 
     except sqlite3.Error:
-        app.logger.exception(
-            "Could not export history"
-        )
+        app.logger.exception("Could not export history")
         return error_response(
-            "Could not export search history.", 500
+            "Could not export search history.",
+            500,
         )
 
 
-# ==================================================
-# ERROR HANDLERS
-# ==================================================
+# =========================================================
+# 13. ERROR HANDLERS
+# =========================================================
 
 @app.errorhandler(404)
 def not_found(error):
     if request.path.startswith("/api/"):
-        return error_response(
-            "API endpoint not found.", 404
-        )
+        return error_response("API endpoint not found.", 404)
 
     return "Page not found.", 404
 
@@ -1139,35 +1143,41 @@ def not_found(error):
 @app.errorhandler(405)
 def method_not_allowed(error):
     return error_response(
-        "HTTP method not allowed.", 405
+        "HTTP method not allowed.",
+        405,
     )
 
 
 @app.errorhandler(413)
 def request_too_large(error):
     return error_response(
-        "Request payload is too large.", 413
+        "Request payload is too large.",
+        413,
     )
 
 
 @app.errorhandler(500)
 def internal_server_error(error):
     app.logger.error(
-        "Unhandled application error: %s", error
-    )
-    return error_response(
-        "An internal server error occurred.", 500
+        "Unhandled application error: %s",
+        error,
     )
 
+    if request.path.startswith("/api/"):
+        return error_response(
+            "An internal server error occurred.",
+            500,
+        )
 
-# ==================================================
-# START APPLICATION
-# ==================================================
+    return "An internal server error occurred.", 500
+
+
+# =========================================================
+# 14. STARTUP
+# =========================================================
 
 initialize_database()
-app.logger.info(
-    "WeatherWorld database initialized."
-)
+app.logger.info("WeatherWorld database initialized.")
 
 
 if __name__ == "__main__":
