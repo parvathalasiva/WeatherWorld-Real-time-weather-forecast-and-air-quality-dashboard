@@ -1,11 +1,9 @@
-
 __pycache__/
 *.py[cod]
 .venv/
 venv/
 .env
-*.db
-*.sqlite
-*.sqlite3
-*-shm
-*-wal
+.vscode/
+weather_history.db
+instance/
+.DS_Store
